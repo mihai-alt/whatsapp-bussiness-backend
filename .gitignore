@@ -1,0 +1,9 @@
+node_modules/
+dist/
+uploads/
+.env
+*.log
+.DS_Store
+coverage/
+.vite/
+backend/uploads/

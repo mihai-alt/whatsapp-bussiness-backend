@@ -1,0 +1,104 @@
+# Render Blueprint — WhatsApp BSP API
+# Dashboard: https://dashboard.render.com → New → Blueprint
+# Docs: https://render.com/docs/blueprint-spec
+#
+# Prerequisites:
+# 1. Push this repo to GitHub/GitLab and connect it to Render
+# 2. Provision a MySQL 8 database (Render has no managed MySQL — use Aiven, Railway, PlanetScale, etc.)
+# 3. After first deploy, set API_URL to your public service URL and run migrate/seed in the Shell
+
+services:
+  - type: web
+    name: whatsapp-bsp-api
+    runtime: node
+    plan: free
+    rootDir: backend
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: APP_URL
+        value: https://dev1125-business.netlify.app
+      - key: API_URL
+        sync: false
+      - key: HOST
+        value: 0.0.0.0
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: whatsapp-bsp-redis
+          property: connectionString
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        value: "3306"
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: DB_NAME
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: JWT_ACCESS_EXPIRES
+        value: 15m
+      - key: JWT_REFRESH_EXPIRES
+        value: 7d
+      - key: SMTP_PROVIDER
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_SECURE
+        value: "false"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: META_APP_ID
+        sync: false
+      - key: META_APP_SECRET
+        sync: false
+      - key: META_CONFIG_ID
+        sync: false
+      - key: META_WEBHOOK_VERIFY_TOKEN
+        sync: false
+      - key: META_GRAPH_VERSION
+        value: v21.0
+      - key: META_SYSTEM_USER_TOKEN
+        sync: false
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      - key: UPLOAD_DIR
+        value: uploads
+      - key: DEFAULT_MESSAGE_COST
+        value: "0.50"
+      - key: LOW_WALLET_THRESHOLD
+        value: "100"
+      - key: WALLET_MIN_RECHARGE
+        value: "100"
+      - key: WALLET_MAX_RECHARGE
+        value: "100000"
+      - key: WALLET_CURRENCY
+        value: INR
+      - key: CAMPAIGN_CONCURRENCY
+        value: "5"
+      - key: CAMPAIGN_SEND_DELAY_MS
+        value: "100"
+
+  - type: keyvalue
+    name: whatsapp-bsp-redis
+    plan: free
+    maxmemoryPolicy: noeviction # safer for BullMQ campaign jobs
+    ipAllowList: [] # internal only — web service uses REDIS_URL
