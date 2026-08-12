@@ -4,7 +4,8 @@ import dotenv from 'dotenv';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Load ONLY backend/.env (keep secrets here — not backend/src/.env)
-dotenv.config({ path: path.resolve(__dirname, '../.env') });
+// override: true so .env wins over leftover shell/system DB_* vars
+dotenv.config({ path: path.resolve(__dirname, '../.env'), override: true });
 
 export const config = {
   port: Number(process.env.PORT || 4000),
