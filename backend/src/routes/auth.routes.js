@@ -71,12 +71,21 @@ router.post(
     // Clear any leftover pending signup from the old email-code flow
     await query('DELETE FROM pending_signups WHERE email = :email', { email });
 
+    // First account in the system is admin; everyone after is member
+    const counts = await query('SELECT COUNT(*) AS c FROM users');
+    const isFirstUser = Number(counts[0]?.c || 0) === 0;
+    const role = isFirstUser ? 'admin' : 'member';
+
     const password_hash = await bcrypt.hash(body.password, 12);
     const result = await query(
       `INSERT INTO users (email, password_hash, name, role, email_verified, email_verified_at)
-       VALUES (:email, :password_hash, :name, 'member', 1, NOW())`,
-      { email, password_hash, name: body.name }
+       VALUES (:email, :password_hash, :name, :role, 1, NOW())`,
+      { email, password_hash, name: body.name, role }
     );
+
+    if (isFirstUser) {
+      await ensurePrimaryAdminIntegrity();
+    }
 
     try {
       const { ensureUserWallet } = await import('../services/wallet.service.js');

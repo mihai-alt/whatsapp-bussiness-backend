@@ -1,17 +1,10 @@
-import bcrypt from 'bcryptjs';
 import { config } from '../config.js';
 import { query } from './pool.js';
 
 async function seed() {
   const users = await query('SELECT COUNT(*) AS c FROM users');
   if (users[0].c === 0) {
-    const hash = await bcrypt.hash('Admin@12345', 12);
-    await query(
-      `INSERT INTO users (email, password_hash, name, role, email_verified, email_verified_at)
-       VALUES (:email, :password_hash, :name, 'admin', 1, NOW())`,
-      { email: 'admin@example.com', password_hash: hash, name: 'Admin' }
-    );
-    console.log('Seeded admin user: admin@example.com / Admin@12345');
+    console.log('No users yet — the first person to register will become admin.');
   }
 
   const wallets = await query('SELECT COUNT(*) AS c FROM wallets WHERE user_id IS NULL');
