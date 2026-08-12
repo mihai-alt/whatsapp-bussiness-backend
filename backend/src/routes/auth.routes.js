@@ -15,13 +15,6 @@ import {
 } from '../middleware/auth.js';
 import { hashToken, randomToken } from '../utils/helpers.js';
 import { sendEmail } from '../services/email.service.js';
-import {
-  startPendingSignup,
-  resendPendingVerification,
-  verifyPendingEmailCode,
-  findPendingSignup,
-  isUserEmailVerified,
-} from '../services/emailVerification.service.js';
 import { config } from '../config.js';
 import { USER_PUBLIC_FIELDS } from '../constants/userFields.js';
 import {
@@ -72,51 +65,59 @@ router.post(
     const body = registerSchema.parse(req.body);
     const email = body.email.toLowerCase();
 
-    const data = await startPendingSignup({
-      email,
-      name: body.name,
-      password: body.password,
-    });
+    const existing = await query('SELECT id FROM users WHERE email = :email LIMIT 1', { email });
+    if (existing.length) throw new AppError('Email already registered', 409, 'EMAIL_EXISTS');
 
-    res.status(201).json({ success: true, data });
+    // Clear any leftover pending signup from the old email-code flow
+    await query('DELETE FROM pending_signups WHERE email = :email', { email });
+
+    const password_hash = await bcrypt.hash(body.password, 12);
+    const result = await query(
+      `INSERT INTO users (email, password_hash, name, role, email_verified, email_verified_at)
+       VALUES (:email, :password_hash, :name, 'member', 1, NOW())`,
+      { email, password_hash, name: body.name }
+    );
+
+    try {
+      const { ensureUserWallet } = await import('../services/wallet.service.js');
+      await ensureUserWallet(result.insertId);
+    } catch {
+      /* lazy */
+    }
+
+    const users = await query(`SELECT ${USER_PUBLIC_FIELDS} FROM users WHERE id = :id LIMIT 1`, {
+      id: result.insertId,
+    });
+    const tokens = await createSession(users[0]);
+
+    res.status(201).json({
+      success: true,
+      data: { user: users[0], ...tokens },
+    });
   })
 );
 
 router.post(
   '/verify-email',
-  asyncHandler(async (req, res) => {
-    const schema = z.object({
-      email: z.string().email(),
-      code: z.string().regex(/^\d{6}$/, 'Code must be 6 digits'),
-    });
-    const body = schema.parse(req.body);
-    const email = body.email.toLowerCase();
-
-    const result = await verifyPendingEmailCode({ email, code: body.code });
-    const tokens = await createSession(result.user);
-
-    res.json({
-      success: true,
-      data: {
-        user: result.user,
-        ...tokens,
-        message: result.alreadyVerified
-          ? 'Email already verified.'
-          : 'Email verified successfully. Your account is now registered.',
-      },
+  asyncHandler(async (_req, res) => {
+    res.status(410).json({
+      success: false,
+      message: 'Email verification is no longer required. Please register or log in directly.',
+      state: 'failed',
+      error: { code: 'EMAIL_VERIFY_DISABLED', message: 'Email verification is disabled' },
     });
   })
 );
 
 router.post(
   '/resend-verification',
-  asyncHandler(async (req, res) => {
-    const schema = z.object({ email: z.string().email() });
-    const { email: raw } = schema.parse(req.body);
-    const email = raw.toLowerCase();
-
-    const data = await resendPendingVerification(email);
-    res.json({ success: true, data: { email, ...data } });
+  asyncHandler(async (_req, res) => {
+    res.status(410).json({
+      success: false,
+      message: 'Email verification is no longer required. Please register or log in directly.',
+      state: 'failed',
+      error: { code: 'EMAIL_VERIFY_DISABLED', message: 'Email verification is disabled' },
+    });
   })
 );
 
@@ -130,18 +131,6 @@ router.post(
     const body = schema.parse(req.body);
     const email = body.email.toLowerCase();
 
-    // Pending signup (not registered yet) — never issue JWT
-    const pending = await findPendingSignup(email);
-    if (pending) {
-      const passwordOk = await bcrypt.compare(body.password, pending.password_hash);
-      if (!passwordOk) throw new AppError('Invalid credentials', 401, 'INVALID_CREDENTIALS');
-      throw new AppError(
-        'Please verify your email before logging in.',
-        403,
-        'EMAIL_NOT_VERIFIED'
-      );
-    }
-
     const users = await query(
       `SELECT ${USER_PUBLIC_FIELDS}, password_hash FROM users WHERE email = :email LIMIT 1`,
       { email }
@@ -154,13 +143,14 @@ router.post(
     const ok = await bcrypt.compare(body.password, user.password_hash);
     if (!ok) throw new AppError('Invalid credentials', 401, 'INVALID_CREDENTIALS');
 
-    // Unverified legacy user rows — still no JWT
-    if (!isUserEmailVerified(user)) {
-      throw new AppError(
-        'Please verify your email before logging in.',
-        403,
-        'EMAIL_NOT_VERIFIED'
+    // Auto-mark legacy unverified accounts as verified (email codes disabled)
+    if (!user.email_verified) {
+      await query(
+        `UPDATE users SET email_verified = 1, email_verified_at = COALESCE(email_verified_at, NOW()) WHERE id = :id`,
+        { id: user.id }
       );
+      user.email_verified = 1;
+      user.email_verified_at = user.email_verified_at || new Date();
     }
 
     const { password_hash: _ph, ...safe } = user;
@@ -192,7 +182,7 @@ router.post(
       `SELECT ${USER_PUBLIC_FIELDS} FROM users WHERE id = :id LIMIT 1`,
       { id: payload.sub }
     );
-    if (!users.length || !users[0].is_active || !isUserEmailVerified(users[0])) {
+    if (!users.length || !users[0].is_active) {
       throw new AppError('Unauthorized', 401);
     }
 
