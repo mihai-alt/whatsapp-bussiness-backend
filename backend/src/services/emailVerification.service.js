@@ -2,7 +2,7 @@ import bcrypt from 'bcryptjs';
 import { query } from '../db/pool.js';
 import { AppError } from '../middleware/error.js';
 import { hashToken, randomDigits } from '../utils/helpers.js';
-import { sendEmail, isSmtpConfigured } from './email.service.js';
+import { sendEmail, isEmailConfigured } from './email.service.js';
 import { USER_PUBLIC_FIELDS } from '../constants/userFields.js';
 
 export const CODE_TTL_MINUTES = 10;
@@ -38,9 +38,9 @@ async function sendVerificationEmail({ email, name, code }) {
 }
 
 function assertSmtpReady() {
-  if (!isSmtpConfigured()) {
+  if (!isEmailConfigured()) {
     throw new AppError(
-      'Email sending is not configured. Set SMTP_USER and SMTP_PASSWORD in backend/.env, then restart the API.',
+      'Email sending is not configured. On Render Free set RESEND_API_KEY (SMTP is blocked). Locally you can use SMTP_USER/SMTP_PASSWORD.',
       503,
       'SMTP_NOT_CONFIGURED'
     );

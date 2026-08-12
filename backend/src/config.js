@@ -51,6 +51,11 @@ export const config = {
       'noreply@example.com',
     secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true',
   },
+  // Resend HTTPS API — works on Render Free (SMTP ports are blocked)
+  resend: {
+    apiKey: process.env.RESEND_API_KEY || '',
+    from: process.env.RESEND_FROM || process.env.EMAIL_FROM || 'onboarding@resend.dev',
+  },
   meta: {
     appId: process.env.META_APP_ID || '',
     appSecret: process.env.META_APP_SECRET || '',

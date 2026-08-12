@@ -1,4 +1,5 @@
 import nodemailer from 'nodemailer';
+import axios from 'axios';
 import { config } from '../config.js';
 
 let transporter;
@@ -41,14 +42,23 @@ export function resolveSmtpSettings() {
   return { host, port, secure, user, pass, from, providerKey };
 }
 
+export function isResendConfigured() {
+  return Boolean(String(config.resend.apiKey || '').trim());
+}
+
 export function isSmtpConfigured() {
   const s = resolveSmtpSettings();
   return Boolean(s.host && s.user && s.pass);
 }
 
-function smtpNotConfiguredError() {
+/** True if either Resend (HTTPS) or classic SMTP is ready. */
+export function isEmailConfigured() {
+  return isResendConfigured() || isSmtpConfigured();
+}
+
+function emailNotConfiguredError() {
   const error = new Error(
-    'Email sending is not configured. Set SMTP_HOST/SMTP_USER/SMTP_PASSWORD (or SMTP_PASS) and EMAIL_FROM in backend/.env, then restart the API.'
+    'Email sending is not configured. On Render Free set RESEND_API_KEY (SMTP ports are blocked). Locally you can use SMTP_USER/SMTP_PASSWORD instead.'
   );
   error.status = 503;
   error.code = 'SMTP_NOT_CONFIGURED';
@@ -57,7 +67,7 @@ function smtpNotConfiguredError() {
 
 function getTransporter() {
   if (transporter) return transporter;
-  if (!isSmtpConfigured()) throw smtpNotConfiguredError();
+  if (!isSmtpConfigured()) throw emailNotConfiguredError();
 
   const s = resolveSmtpSettings();
   transporter = nodemailer.createTransport({
@@ -78,28 +88,65 @@ function getTransporter() {
   return transporter;
 }
 
-export async function sendEmail({ to, subject, text, html }) {
-  if (!isSmtpConfigured()) throw smtpNotConfiguredError();
-
-  const s = resolveSmtpSettings();
-  const tx = getTransporter();
-
-  try {
-    const info = await tx.sendMail({
-      from: s.from || s.user,
-      to,
+async function sendViaResend({ to, subject, text, html }) {
+  const apiKey = String(config.resend.apiKey || '').trim();
+  const from = String(config.resend.from || 'onboarding@resend.dev').trim();
+  const { data } = await axios.post(
+    'https://api.resend.com/emails',
+    {
+      from,
+      to: [to],
       subject,
       text,
       html,
-    });
-    // Do not log message body (may contain verification codes)
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: 20000,
+    }
+  );
+  return { messageId: data?.id || 'resend' };
+}
+
+async function sendViaSmtp({ to, subject, text, html }) {
+  const s = resolveSmtpSettings();
+  const tx = getTransporter();
+  const info = await tx.sendMail({
+    from: s.from || s.user,
+    to,
+    subject,
+    text,
+    html,
+  });
+  return { messageId: info.messageId };
+}
+
+export async function sendEmail({ to, subject, text, html }) {
+  if (!isEmailConfigured()) throw emailNotConfiguredError();
+
+  try {
+    // Prefer Resend on cloud hosts where SMTP is blocked (Render Free).
+    if (isResendConfigured()) {
+      const info = await sendViaResend({ to, subject, text, html });
+      console.log(`[email] delivered to ${to} via resend id=${info.messageId || 'n/a'}`);
+      return info;
+    }
+
+    const s = resolveSmtpSettings();
+    const info = await sendViaSmtp({ to, subject, text, html });
     console.log(`[email] delivered to ${to} via ${s.host} id=${info.messageId || 'n/a'}`);
-    return { messageId: info.messageId };
+    return info;
   } catch (err) {
-    console.error('[email] send failed:', err?.message || err);
-    const error = new Error(
-      `Failed to send email to ${to}. Check SMTP settings (${err.message || 'SMTP error'})`
-    );
+    const detail =
+      err?.response?.data?.message ||
+      err?.response?.data?.error ||
+      err?.message ||
+      'email error';
+    console.error('[email] send failed:', detail);
+    const error = new Error(`Failed to send email to ${to}. Check email settings (${detail})`);
     error.status = 502;
     error.code = 'EMAIL_SEND_FAILED';
     throw error;
