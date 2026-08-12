@@ -17,6 +17,10 @@ export const config = {
     user: process.env.DB_USER || 'root',
     password: process.env.DB_PASSWORD || '',
     database: process.env.DB_NAME || 'whatsapp_bsp',
+    // Aiven and many cloud MySQL hosts require TLS (ssl-mode=REQUIRED)
+    ssl: ['1', 'true', 'yes', 'required'].includes(
+      String(process.env.DB_SSL || '').toLowerCase()
+    ),
   },
   redis: {
     // Render / managed Redis usually provide REDIS_URL (redis:// or rediss://)
