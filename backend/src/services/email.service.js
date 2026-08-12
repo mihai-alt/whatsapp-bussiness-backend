@@ -65,6 +65,11 @@ function getTransporter() {
     port: s.port,
     secure: s.secure,
     requireTLS: !s.secure && s.port === 587,
+    // Render free instances often lack working IPv6; force IPv4 to avoid ENETUNREACH
+    family: 4,
+    connectionTimeout: 20000,
+    greetingTimeout: 20000,
+    socketTimeout: 20000,
     auth: {
       user: s.user,
       pass: s.pass,
