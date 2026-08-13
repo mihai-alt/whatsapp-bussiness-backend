@@ -84,4 +84,16 @@ export const config = {
   lowWalletThreshold: Number(process.env.LOW_WALLET_THRESHOLD || 100),
   campaignConcurrency: Number(process.env.CAMPAIGN_CONCURRENCY || 5),
   campaignSendDelayMs: Number(process.env.CAMPAIGN_SEND_DELAY_MS || 100),
+  // When true, members' launch/schedule goes to pending_approval until an admin approves
+  campaignRequireApproval: ['1', 'true', 'yes'].includes(
+    String(process.env.CAMPAIGN_REQUIRE_APPROVAL || '').toLowerCase()
+  ),
+  storage: {
+    endpoint: process.env.S3_ENDPOINT || '',
+    region: process.env.S3_REGION || 'auto',
+    bucket: process.env.S3_BUCKET || '',
+    accessKeyId: process.env.S3_ACCESS_KEY_ID || '',
+    secretAccessKey: process.env.S3_SECRET_ACCESS_KEY || '',
+    publicBaseUrl: process.env.S3_PUBLIC_BASE_URL || '',
+  },
 };

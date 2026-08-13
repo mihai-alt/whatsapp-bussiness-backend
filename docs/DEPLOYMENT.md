@@ -119,14 +119,15 @@ Allow connections from anywhere (or Render egress) if the provider uses IP allow
   - `API_URL=https://<your-service>.onrender.com`
 
 ### 5. Migrate and seed
-In the Render service → **Shell**:
+Migrations also run automatically on API startup. On Render Free (no Shell), deploy once and confirm logs show migrate success.
+
+If Shell is available:
 
 ```bash
 npm run migrate
-npm run seed
 ```
 
-Default admin after seed: `admin@example.com` / `Admin@12345`
+First user who registers becomes **admin** (lowest `users.id` is kept admin). No default seed password.
 
 ### 6. Point Netlify frontend at the API
 Rebuild/redeploy the frontend with:
@@ -145,6 +146,38 @@ Verify token: same as `META_WEBHOOK_VERIFY_TOKEN`
 - Ephemeral disk: uploaded files under `uploads/` are lost on redeploy — use object storage later if needed
 - CORS is locked to `APP_URL`; it must match the Netlify origin exactly (no trailing slash)
 
+## Launch checklist (do these before real traffic)
+
+### Meta go-live
+1. Set Meta env vars on Render (`META_APP_ID`, `META_APP_SECRET`, `META_CONFIG_ID`, `META_WEBHOOK_VERIFY_TOKEN`, encryption key)
+2. Webhook URL: `https://<api>/webhooks/whatsapp` (or `/api/webhooks/meta` if that is what you registered) — verify token matches
+3. In the app: **Connect** a WhatsApp Business number (Embedded Signup)
+4. Submit/approve at least one template in Meta, sync in Templates
+5. Create a small campaign → send → confirm webhook delivery/read status updates
+
+### Wallet (Razorpay)
+1. Set `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` (test first)
+2. Recharge → balance increases
+3. Send campaign → balance decreases per message cost
+
+### Email (forgot-password)
+- Prefer `RESEND_API_KEY` + `RESEND_FROM` on Render Free (SMTP ports are blocked)
+- Verify a sending domain in Resend for delivery to any recipient (test mode only hits your Resend account email)
+
+### Scheduled campaigns + Redis
+- Campaign schedules live in BullMQ (Redis). On API restart, `recoverCampaignJobs()` re-queues `scheduled`/`queued` from MySQL
+- Still enable **persistence** on Redis/Valkey in Render so delayed jobs survive Redis restarts
+- Free Redis may lose data on restart — recovery from MySQL covers campaign schedules
+
+### Object storage (avatars)
+- Set `S3_*` + `S3_PUBLIC_BASE_URL` (R2 recommended) so uploads survive Render redeploys
+- Without S3, files under `uploads/` are ephemeral
+
+### Optional
+- `CAMPAIGN_REQUIRE_APPROVAL=true` — members create `pending_approval`; admin Approves in Campaigns / Audit Logs
+- Aiven: enable automated backups
+- Uptime monitor (UptimeRobot etc.) on `GET /health`
+
 ## Backups
-- Daily MySQL dumps
-- Persist Redis only if you need durable delayed jobs across restarts (BullMQ jobs are in Redis)
+- Enable Aiven (or MySQL host) automated backups
+- Redis persistence for BullMQ; MySQL is source of truth for scheduled campaign recovery

@@ -14,7 +14,9 @@ import {
   requireRole,
 } from '../middleware/auth.js';
 import { hashToken, randomToken } from '../utils/helpers.js';
-import { sendEmail } from '../services/email.service.js';
+import { sendEmail, isEmailConfigured } from '../services/email.service.js';
+import { persistLocalFile } from '../services/storage.service.js';
+import { writeAudit } from '../services/audit.service.js';
 import { config } from '../config.js';
 import { USER_PUBLIC_FIELDS } from '../constants/userFields.js';
 import {
@@ -22,8 +24,30 @@ import {
   ensurePrimaryAdminIntegrity,
   getPrimaryAdminId,
 } from '../services/primaryAdmin.service.js';
+import { rateLimit } from '../middleware/rateLimit.js';
 
 const router = Router();
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  max: 30,
+  keyFn: (req) => `login:${(req.body?.email || '').toLowerCase()}:${req.ip}`,
+  message: 'Too many login attempts. Please try again in a few minutes.',
+});
+
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60_000,
+  max: 20,
+  keyFn: (req) => `register:${req.ip}`,
+  message: 'Too many accounts created from this network. Please try later.',
+});
+
+const forgotLimiter = rateLimit({
+  windowMs: 60 * 60_000,
+  max: 10,
+  keyFn: (req) => `forgot:${(req.body?.email || '').toLowerCase()}:${req.ip}`,
+  message: 'Too many password reset requests. Please try later.',
+});
 
 async function createSession(user) {
   const accessToken = signAccessToken(user);
@@ -61,6 +85,7 @@ const registerSchema = z.object({
 
 router.post(
   '/register',
+  registerLimiter,
   asyncHandler(async (req, res) => {
     const body = registerSchema.parse(req.body);
     const email = body.email.toLowerCase();
@@ -132,6 +157,7 @@ router.post(
 
 router.post(
   '/login',
+  loginLimiter,
   asyncHandler(async (req, res) => {
     const schema = z.object({
       email: z.string().email(),
@@ -164,13 +190,18 @@ router.post(
 
     // Ensure the earliest account stays admin, then return fresh role from DB
     await ensurePrimaryAdminIntegrity();
+    const primaryAdminId = await getPrimaryAdminId();
     const fresh = await query(`SELECT ${USER_PUBLIC_FIELDS} FROM users WHERE id = :id LIMIT 1`, {
       id: user.id,
     });
-    const safe = fresh[0] || (() => {
+    const base = fresh[0] || (() => {
       const { password_hash: _ph, ...rest } = user;
       return rest;
     })();
+    const safe = {
+      ...base,
+      is_primary_admin: Number(base.id) === Number(primaryAdminId),
+    };
     const tokens = await createSession(safe);
 
     res.json({ success: true, data: { user: safe, ...tokens } });
@@ -210,9 +241,19 @@ router.post(
 
 router.post(
   '/forgot-password',
+  forgotLimiter,
   asyncHandler(async (req, res) => {
     const schema = z.object({ email: z.string().email() });
     const { email } = schema.parse(req.body);
+
+    if (!isEmailConfigured()) {
+      throw new AppError(
+        'Password reset email is not configured. Set RESEND_API_KEY (recommended on Render Free) or SMTP credentials.',
+        503,
+        'EMAIL_NOT_CONFIGURED'
+      );
+    }
+
     const users = await query('SELECT id, email, name FROM users WHERE email = :email LIMIT 1', {
       email: email.toLowerCase(),
     });
@@ -225,12 +266,28 @@ router.post(
         { user_id: users[0].id, token_hash }
       );
       const resetUrl = `${config.appUrl}/reset-password?token=${token}`;
-      await sendEmail({
-        to: users[0].email,
-        subject: 'Reset your password',
-        text: `Hi ${users[0].name},\n\nReset your password: ${resetUrl}\n\nThis link expires in 1 hour.`,
-        html: `<p>Hi ${users[0].name},</p><p><a href="${resetUrl}">Reset your password</a></p><p>This link expires in 1 hour.</p>`,
-      });
+      try {
+        await sendEmail({
+          to: users[0].email,
+          subject: 'Reset your password',
+          text: `Hi ${users[0].name},\n\nReset your password: ${resetUrl}\n\nThis link expires in 1 hour.`,
+          html: `<p>Hi ${users[0].name},</p><p><a href="${resetUrl}">Reset your password</a></p><p>This link expires in 1 hour.</p>`,
+        });
+        await writeAudit({
+          userId: users[0].id,
+          action: 'auth.password_reset_requested',
+          entityType: 'user',
+          entityId: users[0].id,
+          ip: req.ip,
+        });
+      } catch (err) {
+        console.error('forgot-password email failed:', err.message);
+        throw new AppError(
+          'Unable to send password reset email. Check RESEND_API_KEY / SMTP settings.',
+          502,
+          'EMAIL_SEND_FAILED'
+        );
+      }
     }
     res.json({ success: true, data: { message: 'If the email exists, a reset link was sent.' } });
   })
@@ -294,10 +351,20 @@ router.get(
   authenticate,
   asyncHandler(async (req, res) => {
     await ensurePrimaryAdminIntegrity();
+    const primaryAdminId = await getPrimaryAdminId();
     const users = await query(`SELECT ${USER_PUBLIC_FIELDS} FROM users WHERE id = :id LIMIT 1`, {
       id: req.user.id,
     });
-    res.json({ success: true, data: { user: users[0] || req.user } });
+    const user = users[0] || req.user;
+    res.json({
+      success: true,
+      data: {
+        user: {
+          ...user,
+          is_primary_admin: Number(user.id) === Number(primaryAdminId),
+        },
+      },
+    });
   })
 );
 
@@ -380,7 +447,12 @@ router.post(
       id: req.user.id,
     });
     const previous = users[0]?.avatar_url;
-    const avatarUrl = `/uploads/avatars/${req.file.filename}`;
+    const key = `avatars/${req.file.filename}`;
+    const stored = await persistLocalFile(req.file.path, {
+      key,
+      contentType: req.file.mimetype,
+    });
+    const avatarUrl = stored.url;
 
     await query('UPDATE users SET avatar_url = :avatar_url WHERE id = :id', {
       avatar_url: avatarUrl,
@@ -644,24 +716,14 @@ router.patch(
       id: userId,
     });
 
-    try {
-      await query(
-        `INSERT INTO audit_logs (user_id, action, meta, ip)
-         VALUES (:user_id, :action, :meta, :ip)`,
-        {
-          user_id: req.user.id,
-          action: 'user.role_changed',
-          meta: JSON.stringify({
-            targetUserId: userId,
-            from: target.role,
-            to: role,
-          }),
-          ip: req.ip || null,
-        }
-      );
-    } catch {
-      /* audit is best-effort */
-    }
+    await writeAudit({
+      userId: req.user.id,
+      action: 'user.role_changed',
+      entityType: 'user',
+      entityId: userId,
+      meta: { targetUserId: userId, from: target.role, to: role },
+      ip: req.ip,
+    });
 
     const primaryAdminId = await getPrimaryAdminId();
     const updated = await query(

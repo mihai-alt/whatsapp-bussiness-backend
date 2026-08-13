@@ -10,6 +10,7 @@ import {
   listNumbersForUser,
   refreshNumber,
 } from '../services/numberConnection.service.js';
+import { writeAudit } from '../services/audit.service.js';
 
 const router = Router();
 
@@ -78,6 +79,17 @@ router.post(
         userId: req.user.id,
         rawBody: body,
       });
+      await writeAudit({
+        userId: req.user.id,
+        action: 'whatsapp.number_connected',
+        entityType: 'whatsapp_account',
+        entityId: number?.id,
+        meta: {
+          phone_number: number?.phone_number || number?.display_phone_number,
+          waba_id: number?.waba_id,
+        },
+        ip: req.ip,
+      });
       res.status(201).json({
         success: true,
         message: 'WhatsApp Business number connected successfully.',
@@ -142,6 +154,17 @@ router.post(
         userId: req.user.id,
         rawBody: body,
         reconnectAccountId: req.params.id,
+      });
+      await writeAudit({
+        userId: req.user.id,
+        action: 'whatsapp.number_reconnected',
+        entityType: 'whatsapp_account',
+        entityId: number?.id || Number(req.params.id),
+        meta: {
+          phone_number: number?.phone_number || number?.display_phone_number,
+          waba_id: number?.waba_id,
+        },
+        ip: req.ip,
       });
       res.json({
         success: true,

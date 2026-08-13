@@ -3,7 +3,6 @@ import { config } from '../config.js';
 import { AppError } from './error.js';
 import { query } from '../db/pool.js';
 import { USER_PUBLIC_FIELDS } from '../constants/userFields.js';
-import { isUserEmailVerified } from '../services/emailVerification.service.js';
 
 export function signAccessToken(user) {
   return jwt.sign(
@@ -30,7 +29,8 @@ export async function authenticate(req, res, next) {
       `SELECT ${USER_PUBLIC_FIELDS} FROM users WHERE id = :id LIMIT 1`,
       { id: payload.sub }
     );
-    if (!users.length || !users[0].is_active || !isUserEmailVerified(users[0])) {
+    // Email verification no longer required for access
+    if (!users.length || !users[0].is_active) {
       throw new AppError('Unauthorized', 401, 'UNAUTHORIZED');
     }
     req.user = users[0];

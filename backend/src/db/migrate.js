@@ -189,7 +189,7 @@ const statements = [
     whatsapp_account_id INT UNSIGNED NULL,
     template_id INT UNSIGNED NULL,
     contact_group_id INT UNSIGNED NULL,
-    status ENUM('draft','scheduled','queued','running','paused','completed','cancelled','failed') NOT NULL DEFAULT 'draft',
+    status ENUM('draft','pending_approval','scheduled','queued','running','paused','completed','cancelled','failed') NOT NULL DEFAULT 'draft',
     variable_mapping JSON NULL,
     scheduled_at DATETIME NULL,
     started_at DATETIME NULL,
@@ -758,6 +758,18 @@ async function migrate() {
     await root.query(`ALTER TABLE campaigns ADD INDEX idx_campaigns_scheduled (scheduled_at)`);
   } catch (err) {
     if (err.code !== 'ER_DUP_KEYNAME') console.warn('idx_campaigns_scheduled skipped:', err.message);
+  }
+
+  // Allow member→admin approval workflow on existing DBs
+  try {
+    await root.query(
+      `ALTER TABLE campaigns
+       MODIFY COLUMN status ENUM('draft','pending_approval','scheduled','queued','running','paused','completed','cancelled','failed')
+       NOT NULL DEFAULT 'draft'`
+    );
+    console.log('Updated campaigns.status enum (pending_approval)');
+  } catch (err) {
+    console.warn('campaigns.status enum update skipped:', err.message);
   }
 
   // Campaign create-wizard metadata (description, type, tags, priority, notes)

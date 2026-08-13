@@ -18,6 +18,7 @@ import {
   createManualRechargeIntent,
 } from '../services/recharge.service.js';
 import { paymentGateway } from '../services/payment.gateway.js';
+import { writeAudit } from '../services/audit.service.js';
 import { query } from '../db/pool.js';
 import { config } from '../config.js';
 
@@ -170,6 +171,14 @@ router.post(
         wallet_id: wallet.id,
       }
     );
+    await writeAudit({
+      userId: req.user.id,
+      action: 'wallet.admin_credit',
+      entityType: 'wallet',
+      entityId: wallet.id,
+      meta: { amount: body.amount, description: body.description || null },
+      ip: req.ip,
+    });
     res.json({ success: true, data: { balance } });
   })
 );
@@ -181,6 +190,7 @@ router.post('/admin-credit', requireRole('admin'), asyncHandler(async (req, res)
   });
   const body = schema.parse(req.body);
   const refId = `admin_${req.user.id}_${Date.now()}`;
+  const wallet = await getBusinessWallet();
   const balance = await creditWallet({
     userId: req.user.id,
     amount: body.amount,
@@ -188,6 +198,14 @@ router.post('/admin-credit', requireRole('admin'), asyncHandler(async (req, res)
     createdBy: req.user.id,
     referenceType: 'admin_credit',
     referenceId: refId,
+  });
+  await writeAudit({
+    userId: req.user.id,
+    action: 'wallet.admin_credit',
+    entityType: 'wallet',
+    entityId: wallet.id,
+    meta: { amount: body.amount, description: body.description || null, via: 'admin-credit' },
+    ip: req.ip,
   });
   res.json({ success: true, data: { balance } });
 }));
@@ -231,6 +249,19 @@ router.post(
       razorpayPaymentId: body.razorpay_payment_id,
       razorpaySignature: body.razorpay_signature,
       userId: req.user.id,
+    });
+    await writeAudit({
+      userId: req.user.id,
+      action: 'wallet.recharge_verified',
+      entityType: 'recharge',
+      entityId: data?.recharge?.id || null,
+      meta: {
+        amount: data?.recharge?.amount ?? null,
+        alreadyCredited: data?.alreadyCredited ?? false,
+        razorpay_order_id: body.razorpay_order_id,
+        razorpay_payment_id: body.razorpay_payment_id,
+      },
+      ip: req.ip,
     });
     res.json({ success: true, data });
   })

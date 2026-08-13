@@ -3,12 +3,14 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { z } from 'zod';
-import { authenticate } from '../middleware/auth.js';
+import { authenticate, requireRole } from '../middleware/auth.js';
 import { asyncHandler, AppError } from '../middleware/error.js';
+import { rateLimit } from '../middleware/rateLimit.js';
 import { query } from '../db/pool.js';
 import { config } from '../config.js';
 import { getMessageCost, getWallet } from '../services/wallet.service.js';
 import { notifyProjectEvent } from '../services/notification.service.js';
+import { writeAudit } from '../services/audit.service.js';
 import { normalizePhone, parseJson } from '../utils/helpers.js';
 import { parseSpreadsheetFile } from '../utils/spreadsheet.js';
 import {
@@ -31,8 +33,22 @@ fs.mkdirSync(uploadDir, { recursive: true });
 const upload = multer({ dest: uploadDir });
 
 const PAUSABLE = ['running', 'queued', 'scheduled'];
-const CANCELLABLE = ['draft', 'scheduled', 'queued', 'running', 'paused', 'failed'];
+const CANCELLABLE = [
+  'draft',
+  'pending_approval',
+  'scheduled',
+  'queued',
+  'running',
+  'paused',
+  'failed',
+];
 
+const createCampaignLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 10,
+  keyFn: (req) => `campaign-create:${req.user?.id || req.ip}`,
+  message: 'Too many campaigns created. Please wait a minute and try again.',
+});
 function unlinkQuiet(filePath) {
   try {
     if (filePath) fs.unlinkSync(filePath);
@@ -313,6 +329,7 @@ router.get(
 
 router.post(
   '/',
+  createCampaignLimiter,
   upload.single('file'),
   asyncHandler(async (req, res) => {
     const schema = z.object({
@@ -477,15 +494,26 @@ router.post(
       );
     }
 
+    const needsApproval =
+      config.campaignRequireApproval &&
+      req.user.role !== 'admin' &&
+      !saveAsDraft &&
+      (wantsImmediate || wantsSchedule);
+
     const status = saveAsDraft
       ? 'draft'
-      : wantsSchedule
-        ? 'scheduled'
-        : wantsImmediate
-          ? 'queued'
-          : 'draft';
+      : needsApproval
+        ? 'pending_approval'
+        : wantsSchedule
+          ? 'scheduled'
+          : wantsImmediate
+            ? 'queued'
+            : 'draft';
 
-    if ((status === 'queued' || status === 'scheduled') && (!account || !template || !finalRecipients.length)) {
+    if (
+      (status === 'queued' || status === 'scheduled' || status === 'pending_approval') &&
+      (!account || !template || !finalRecipients.length)
+    ) {
       throw new AppError(
         'WhatsApp number, approved template, and recipients are required to launch or schedule',
         400,
@@ -557,7 +585,82 @@ router.post(
       meta: { campaignId, status, createdBy: req.user.id },
       actorUserId: req.user.id,
     });
+    await writeAudit({
+      userId: req.user.id,
+      action: 'campaign.created',
+      entityType: 'campaign',
+      entityId: campaignId,
+      meta: { status, name: body.name.trim() },
+      ip: req.ip,
+    });
     res.status(201).json({ success: true, data: created });
+  })
+);
+
+router.post(
+  '/:id/approve',
+  requireRole('admin'),
+  asyncHandler(async (req, res) => {
+    const campaign = await loadCampaignOrThrow(req.params.id);
+    if (campaign.status !== 'pending_approval') {
+      throw new AppError(
+        `Only campaigns awaiting approval can be approved (current: ${campaign.status}).`,
+        400,
+        'INVALID_STATE'
+      );
+    }
+    if (!campaign.whatsapp_account_id || !campaign.template_id) {
+      throw new AppError('Campaign is incomplete', 400, 'INCOMPLETE_CAMPAIGN');
+    }
+    if (campaign.account_status !== 'connected') {
+      throw new AppError('WhatsApp number is disconnected', 400, 'NUMBER_NOT_CONNECTED');
+    }
+
+    const when = campaign.scheduled_at ? new Date(campaign.scheduled_at).getTime() : null;
+    const launchNow = !when || when <= Date.now();
+
+    if (launchNow) {
+      await drainCampaignJobs(campaign.id, { removeScheduled: true });
+      await query(
+        `UPDATE campaigns SET status = 'queued', started_at = COALESCE(started_at, NOW()) WHERE id = :id`,
+        { id: campaign.id }
+      );
+      await enqueueCampaign(Number(campaign.id));
+    } else {
+      const delay = Math.max(0, when - Date.now());
+      await query(`UPDATE campaigns SET status = 'scheduled' WHERE id = :id`, { id: campaign.id });
+      await getCampaignQueue().add(
+        'run-campaign',
+        { campaignId: Number(campaign.id) },
+        { delay, jobId: `campaign-sched-${campaign.id}`, removeOnComplete: 100 }
+      );
+    }
+
+    await writeAudit({
+      userId: req.user.id,
+      action: 'campaign.approved',
+      entityType: 'campaign',
+      entityId: campaign.id,
+      meta: { launchNow },
+      ip: req.ip,
+    });
+    await notifyProjectEvent({
+      type: 'campaign_approved',
+      title: 'Campaign approved',
+      body: `Admin approved campaign "${campaign.name}".`,
+      meta: { campaignId: campaign.id },
+      actorUserId: req.user.id,
+      relatedUserIds: campaign.created_by ? [campaign.created_by] : [],
+    });
+
+    const updated = await loadCampaignOrThrow(campaign.id);
+    res.json({
+      success: true,
+      data: {
+        message: launchNow ? 'Campaign approved and launched' : 'Campaign approved and scheduled',
+        campaign: updated,
+      },
+    });
   })
 );
 
@@ -565,9 +668,12 @@ router.post(
   '/:id/send',
   asyncHandler(async (req, res) => {
     const campaign = await loadCampaignOrThrow(req.params.id);
-    if (!['draft', 'scheduled'].includes(campaign.status)) {
+    if (campaign.status === 'pending_approval' && req.user.role !== 'admin') {
+      throw new AppError('This campaign is waiting for admin approval.', 403, 'PENDING_APPROVAL');
+    }
+    if (!['draft', 'scheduled', 'pending_approval'].includes(campaign.status)) {
       throw new AppError(
-        `Cannot launch a campaign in status "${campaign.status}". Only draft or scheduled campaigns can be launched immediately.`,
+        `Cannot launch a campaign in status "${campaign.status}". Only draft, scheduled, or pending-approval campaigns can be launched.`,
         400,
         'INVALID_STATE'
       );
@@ -606,6 +712,32 @@ router.post(
       );
     }
 
+    if (
+      config.campaignRequireApproval &&
+      req.user.role !== 'admin' &&
+      campaign.status !== 'pending_approval'
+    ) {
+      await query(`UPDATE campaigns SET status = 'pending_approval' WHERE id = :id`, {
+        id: campaign.id,
+      });
+      await writeAudit({
+        userId: req.user.id,
+        action: 'campaign.submitted_for_approval',
+        entityType: 'campaign',
+        entityId: campaign.id,
+        ip: req.ip,
+      });
+      const waiting = await loadCampaignOrThrow(campaign.id);
+      return res.json({
+        success: true,
+        data: {
+          message: 'Campaign submitted for admin approval',
+          status: waiting.status,
+          campaign: waiting,
+        },
+      });
+    }
+
     // Drop any delayed schedule job, then start immediately
     await drainCampaignJobs(campaign.id, { removeScheduled: true });
     await query(
@@ -618,6 +750,13 @@ router.post(
     );
     await enqueueCampaign(Number(campaign.id));
     await refreshCampaignStatus(Number(campaign.id));
+    await writeAudit({
+      userId: req.user.id,
+      action: 'campaign.launched',
+      entityType: 'campaign',
+      entityId: campaign.id,
+      ip: req.ip,
+    });
 
     const updated = await loadCampaignOrThrow(campaign.id);
     res.json({

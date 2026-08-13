@@ -29,6 +29,7 @@ import webhookRoutes from './routes/webhook.routes.js';
 import numbersRoutes from './routes/numbers.routes.js';
 import metaRoutes from './routes/meta.routes.js';
 import razorpayWebhookRoutes from './routes/razorpayWebhook.routes.js';
+import auditRoutes from './routes/audit.routes.js';
 
 fs.mkdirSync(path.resolve(config.uploadDir), { recursive: true });
 
@@ -78,7 +79,11 @@ app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(path.resolve(config.uploadDir)));
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'whatsapp-bsp-api' });
+  res.json({
+    ok: true,
+    service: 'whatsapp-bsp-api',
+    ts: new Date().toISOString(),
+  });
 });
 
 app.use('/api/auth', authRoutes);
@@ -94,6 +99,7 @@ app.use('/api/campaigns', campaignRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/audit-logs', auditRoutes);
 
 app.use(errorHandler);
 

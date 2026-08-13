@@ -346,6 +346,78 @@ export async function refreshCampaignStatus(campaignId) {
   });
 }
 
+/**
+ * Re-hydrate scheduled / queued campaigns from MySQL into BullMQ after Redis restarts.
+ * Overdue scheduled campaigns launch immediately; future ones get a new delayed job.
+ */
+export async function recoverCampaignJobs() {
+  const queue = getCampaignQueue();
+  const now = Date.now();
+
+  const scheduled = await query(
+    `SELECT id, scheduled_at, status FROM campaigns
+     WHERE status IN ('scheduled', 'queued')
+     ORDER BY id ASC`
+  );
+
+  let recovered = 0;
+  for (const row of scheduled) {
+    const campaignId = Number(row.id);
+    if (row.status === 'queued') {
+      const jobId = `campaign-recover-${campaignId}`;
+      try {
+        const existing = await queue.getJob(jobId);
+        if (existing) {
+          const state = await existing.getState();
+          if (['waiting', 'delayed', 'active', 'paused'].includes(state)) continue;
+          await existing.remove().catch(() => {});
+        }
+        await queue.add('run-campaign', { campaignId }, { jobId, removeOnComplete: 100 });
+        recovered += 1;
+      } catch (err) {
+        console.warn(`recover queued campaign #${campaignId}:`, err.message);
+      }
+      continue;
+    }
+
+    // scheduled
+    const when = row.scheduled_at ? new Date(row.scheduled_at).getTime() : NaN;
+    const schedJobId = `campaign-sched-${campaignId}`;
+    try {
+      const existing = await queue.getJob(schedJobId);
+      if (existing) {
+        const state = await existing.getState();
+        if (['waiting', 'delayed', 'active', 'paused'].includes(state)) continue;
+        await existing.remove().catch(() => {});
+      }
+
+      if (!Number.isFinite(when) || when <= now) {
+        await queue.add(
+          'run-campaign',
+          { campaignId },
+          { jobId: `campaign-recover-${campaignId}`, removeOnComplete: 100 }
+        );
+      } else {
+        await queue.add(
+          'run-campaign',
+          { campaignId },
+          {
+            jobId: schedJobId,
+            delay: Math.max(0, when - now),
+            removeOnComplete: 100,
+          }
+        );
+      }
+      recovered += 1;
+    } catch (err) {
+      console.warn(`recover scheduled campaign #${campaignId}:`, err.message);
+    }
+  }
+
+  if (recovered) console.log(`Recovered ${recovered} campaign job(s) from database`);
+  return recovered;
+}
+
 export function startCampaignWorker() {
   if (worker) return worker;
   worker = new Worker(
@@ -354,7 +426,7 @@ export function startCampaignWorker() {
       if (job.name === 'run-campaign') {
         const { campaignId } = job.data;
         await query(
-          `UPDATE campaigns SET status = 'running', started_at = COALESCE(started_at, NOW()) WHERE id = :id AND status IN ('queued','scheduled','running')`,
+          `UPDATE campaigns SET status = 'running', started_at = COALESCE(started_at, NOW()) WHERE id = :id AND status IN ('queued','scheduled','running','pending_approval')`,
           { id: campaignId }
         );
         await enqueueCampaignMessages(campaignId);
@@ -372,6 +444,11 @@ export function startCampaignWorker() {
 
   worker.on('failed', (job, err) => {
     console.error('Campaign job failed', job?.id, err.message);
+  });
+
+  // Fire-and-forget recovery so boot is not blocked on Redis hiccups
+  recoverCampaignJobs().catch((err) => {
+    console.warn('Campaign job recovery skipped:', err.message);
   });
 
   return worker;
