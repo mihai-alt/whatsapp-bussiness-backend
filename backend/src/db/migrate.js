@@ -844,8 +844,36 @@ async function migrate() {
 
   // First signup must remain active admin (role/status immutable by policy)
   try {
+    // Remove automated probe/test accounts so the first real signup stays primary admin
+    await root.query(
+      `DELETE FROM refresh_tokens WHERE user_id IN (
+         SELECT id FROM (
+           SELECT id FROM users
+           WHERE email LIKE 'probe-%@example.com'
+              OR email LIKE 'test-diag-%@example.com'
+              OR email = 'admin@example.com'
+         ) t
+       )`
+    );
+    await root.query(
+      `DELETE FROM wallets WHERE user_id IN (
+         SELECT id FROM (
+           SELECT id FROM users
+           WHERE email LIKE 'probe-%@example.com'
+              OR email LIKE 'test-diag-%@example.com'
+              OR email = 'admin@example.com'
+         ) t
+       )`
+    );
+    await root.query(
+      `DELETE FROM users
+       WHERE email LIKE 'probe-%@example.com'
+          OR email LIKE 'test-diag-%@example.com'
+          OR email = 'admin@example.com'`
+    );
+
     const [firstUsers] = await root.query(
-      `SELECT id, role, is_active FROM users ORDER BY id ASC LIMIT 1`
+      `SELECT id, email, role, is_active FROM users ORDER BY id ASC LIMIT 1`
     );
     if (firstUsers.length) {
       const first = firstUsers[0];
@@ -854,7 +882,7 @@ async function migrate() {
           `UPDATE users SET role = 'admin', is_active = 1 WHERE id = ?`,
           [first.id]
         );
-        console.log(`Restored primary admin privileges for user #${first.id}`);
+        console.log(`Restored primary admin privileges for user #${first.id} (${first.email})`);
       }
     }
   } catch (err) {

@@ -162,7 +162,15 @@ router.post(
       user.email_verified_at = user.email_verified_at || new Date();
     }
 
-    const { password_hash: _ph, ...safe } = user;
+    // Ensure the earliest account stays admin, then return fresh role from DB
+    await ensurePrimaryAdminIntegrity();
+    const fresh = await query(`SELECT ${USER_PUBLIC_FIELDS} FROM users WHERE id = :id LIMIT 1`, {
+      id: user.id,
+    });
+    const safe = fresh[0] || (() => {
+      const { password_hash: _ph, ...rest } = user;
+      return rest;
+    })();
     const tokens = await createSession(safe);
 
     res.json({ success: true, data: { user: safe, ...tokens } });
@@ -285,7 +293,11 @@ router.get(
   '/me',
   authenticate,
   asyncHandler(async (req, res) => {
-    res.json({ success: true, data: { user: req.user } });
+    await ensurePrimaryAdminIntegrity();
+    const users = await query(`SELECT ${USER_PUBLIC_FIELDS} FROM users WHERE id = :id LIMIT 1`, {
+      id: req.user.id,
+    });
+    res.json({ success: true, data: { user: users[0] || req.user } });
   })
 );
 

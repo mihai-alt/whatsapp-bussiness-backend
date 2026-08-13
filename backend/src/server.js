@@ -12,6 +12,7 @@ import { errorHandler } from './middleware/error.js';
 import { setIO } from './realtime.js';
 import { startCampaignWorker } from './queues/campaign.queue.js';
 import { runMigrations } from './db/migrate.js';
+import { ensurePrimaryAdminIntegrity } from './services/primaryAdmin.service.js';
 
 import authRoutes from './routes/auth.routes.js';
 import walletRoutes from './routes/wallet.routes.js';
@@ -129,6 +130,7 @@ const listenHost = process.env.HOST || (config.nodeEnv === 'production' ? '0.0.0
 async function boot() {
   try {
     await runMigrations();
+    await ensurePrimaryAdminIntegrity();
   } catch (err) {
     console.error('Startup migration failed:', err?.message || err);
     if (config.nodeEnv === 'production') process.exit(1);
