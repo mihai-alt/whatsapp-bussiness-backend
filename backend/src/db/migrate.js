@@ -1,3 +1,5 @@
+import path from 'path';
+import { pathToFileURL } from 'url';
 import mysql from 'mysql2/promise';
 import { config } from '../config.js';
 
@@ -343,6 +345,7 @@ async function migrate() {
     user: config.db.user,
     password: config.db.password,
     multipleStatements: true,
+    ...(config.db.ssl ? { ssl: { rejectUnauthorized: false } } : {}),
   });
 
   await root.query(`CREATE DATABASE IF NOT EXISTS \`${config.db.database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
@@ -862,7 +865,17 @@ async function migrate() {
   console.log('Migration completed successfully.');
 }
 
-migrate().catch((err) => {
-  console.error('Migration failed:', err.message);
-  process.exit(1);
-});
+export async function runMigrations() {
+  await migrate();
+}
+
+const isDirectRun =
+  process.argv[1] &&
+  pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
+
+if (isDirectRun) {
+  migrate().catch((err) => {
+    console.error('Migration failed:', err.message);
+    process.exit(1);
+  });
+}

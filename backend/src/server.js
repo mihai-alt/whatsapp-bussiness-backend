@@ -11,6 +11,7 @@ import { config } from './config.js';
 import { errorHandler } from './middleware/error.js';
 import { setIO } from './realtime.js';
 import { startCampaignWorker } from './queues/campaign.queue.js';
+import { runMigrations } from './db/migrate.js';
 
 import authRoutes from './routes/auth.routes.js';
 import walletRoutes from './routes/wallet.routes.js';
@@ -124,6 +125,18 @@ server.on('error', (err) => {
 
 // Bind 0.0.0.0 in production so cloud hosts (Render, etc.) can reach the process.
 const listenHost = process.env.HOST || (config.nodeEnv === 'production' ? '0.0.0.0' : '127.0.0.1');
-server.listen(config.port, listenHost, () => {
-  console.log(`API listening on http://${listenHost}:${config.port}`);
-});
+
+async function boot() {
+  try {
+    await runMigrations();
+  } catch (err) {
+    console.error('Startup migration failed:', err?.message || err);
+    if (config.nodeEnv === 'production') process.exit(1);
+  }
+
+  server.listen(config.port, listenHost, () => {
+    console.log(`API listening on http://${listenHost}:${config.port}`);
+  });
+}
+
+boot();
