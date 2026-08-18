@@ -339,6 +339,12 @@ router.put(
       { id: req.params.id }
     );
     res.json({ success: true, data: decorateTemplate(updated[0]) });
+    emitWorkspaceChanged({
+      resource: 'templates',
+      action: 'updated',
+      actorUserId: req.user.id,
+      entityId: Number(req.params.id),
+    });
   })
 );
 
@@ -472,6 +478,12 @@ router.post(
       success: true,
       data: { upserted, created, updated, total: items.length, stats },
     });
+    emitWorkspaceChanged({
+      resource: 'templates',
+      action: 'synced',
+      actorUserId: req.user.id,
+      meta: { upserted, created, updated },
+    });
   })
 );
 
@@ -495,6 +507,12 @@ router.delete(
       }
     }
     await query('DELETE FROM templates WHERE id = :id', { id: tpl.id });
+    emitWorkspaceChanged({
+      resource: 'templates',
+      action: 'deleted',
+      actorUserId: req.user.id,
+      entityId: tpl.id,
+    });
     res.json({ success: true, data: { message: 'Deleted', id: tpl.id } });
   })
 );

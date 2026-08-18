@@ -33,14 +33,13 @@ import {
   listShareableMembers,
   grantGroupAccess,
   revokeGroupAccess,
-  clearGroupAccess,
   listContactEditableGroupIds,
   GROUP_ACCESS_MODE,
   normalizeGroupStatus,
   normalizeAccessMode,
 } from '../services/contactAccess.service.js';
 import { notifyProjectEvent } from '../services/notification.service.js';
-import { emitWorkspaceChanged } from '../realtime.js';
+import { emitToUser, emitWorkspaceChanged } from '../realtime.js';
 
 const router = Router();
 router.use(authenticate);
@@ -625,6 +624,14 @@ router.post(
       entityId: group.id,
       meta: { targetUserId: body.userId },
     });
+    emitToUser(body.userId, 'workspace:changed', {
+      resource: 'groups',
+      action: 'access_granted',
+      actorUserId: req.user.id,
+      entityId: group.id,
+      meta: { targetUserId: body.userId },
+      at: new Date().toISOString(),
+    });
 
     res.status(201).json({ success: true, data: { users } });
   })
@@ -660,6 +667,14 @@ router.delete(
       actorUserId: req.user.id,
       entityId: group.id,
       meta: { targetUserId },
+    });
+    emitToUser(targetUserId, 'workspace:changed', {
+      resource: 'groups',
+      action: 'access_revoked',
+      actorUserId: req.user.id,
+      entityId: group.id,
+      meta: { targetUserId },
+      at: new Date().toISOString(),
     });
 
     res.json({ success: true, data: { users } });
@@ -761,14 +776,8 @@ router.patch(
       throw err;
     }
 
-    // SHARED → PRIVATE clears explicit member access (contacts/history untouched)
-    if (
-      normalizeAccessMode(group.access_mode) === GROUP_ACCESS_MODE.SHARED &&
-      nextAccess === GROUP_ACCESS_MODE.PRIVATE
-    ) {
-      await clearGroupAccess(group.id);
-    }
-
+    // SHARED → PRIVATE ends org-wide access; keep selective member grants
+    // (owner can still remove members individually)
     const prevAccess = normalizeAccessMode(group.access_mode);
     if (body.accessMode !== undefined && nextAccess !== prevAccess) {
       const groupLabel = body.name || group.name;
@@ -787,7 +796,7 @@ router.patch(
         title: shared ? 'Group access shared' : 'Group access set to private',
         body: shared
           ? `${req.user.name || 'A user'} made "${groupLabel}" Shared — all members can view and use it.`
-          : `${req.user.name || 'A user'} made "${groupLabel}" Private — only the owner and admins can access it.`,
+          : `${req.user.name || 'A user'} made "${groupLabel}" Private — only owner, admins, and invited members can access it.`,
         meta: {
           groupId: group.id,
           accessMode: nextAccess,

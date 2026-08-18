@@ -84,6 +84,8 @@ export const config = {
   lowWalletThreshold: Number(process.env.LOW_WALLET_THRESHOLD || 100),
   campaignConcurrency: Number(process.env.CAMPAIGN_CONCURRENCY || 5),
   campaignSendDelayMs: Number(process.env.CAMPAIGN_SEND_DELAY_MS || 100),
+  // bcrypt cost: 10 ≈ 4× faster than 12; still strong. Override with BCRYPT_ROUNDS.
+  bcryptRounds: Math.min(14, Math.max(8, Number(process.env.BCRYPT_ROUNDS || 10))),
   // When true, members' launch/schedule goes to pending_approval until an admin approves
   campaignRequireApproval: ['1', 'true', 'yes'].includes(
     String(process.env.CAMPAIGN_REQUIRE_APPROVAL || '').toLowerCase()

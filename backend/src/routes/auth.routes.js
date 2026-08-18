@@ -17,16 +17,21 @@ import { hashToken, randomToken } from '../utils/helpers.js';
 import { sendEmail, isEmailConfigured } from '../services/email.service.js';
 import { persistLocalFile } from '../services/storage.service.js';
 import { writeAudit } from '../services/audit.service.js';
+import { emitWorkspaceChanged } from '../realtime.js';
 import { config } from '../config.js';
 import { USER_PUBLIC_FIELDS } from '../constants/userFields.js';
 import {
   assertPrimaryAdminRoleStatusImmutable,
-  ensurePrimaryAdminIntegrity,
   getPrimaryAdminId,
+  invalidatePrimaryAdminCache,
 } from '../services/primaryAdmin.service.js';
 import { rateLimit } from '../middleware/rateLimit.js';
 
 const router = Router();
+
+function hashPassword(password) {
+  return bcrypt.hash(password, config.bcryptRounds);
+}
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60_000,
@@ -90,43 +95,50 @@ router.post(
     const body = registerSchema.parse(req.body);
     const email = body.email.toLowerCase();
 
-    const existing = await query('SELECT id FROM users WHERE email = :email LIMIT 1', { email });
+    // Parallel lookups — avoid serial round-trips to Aiven
+    const [existing, counts] = await Promise.all([
+      query('SELECT id FROM users WHERE email = :email LIMIT 1', { email }),
+      query('SELECT COUNT(*) AS c FROM users'),
+    ]);
     if (existing.length) throw new AppError('Email already registered', 409, 'EMAIL_EXISTS');
 
-    // Clear any leftover pending signup from the old email-code flow
-    await query('DELETE FROM pending_signups WHERE email = :email', { email });
-
-    // First account in the system is admin; everyone after is member
-    const counts = await query('SELECT COUNT(*) AS c FROM users');
     const isFirstUser = Number(counts[0]?.c || 0) === 0;
     const role = isFirstUser ? 'admin' : 'member';
 
-    const password_hash = await bcrypt.hash(body.password, 12);
+    // bcrypt is the main CPU cost on Render Free — use config.bcryptRounds (default 10)
+    const password_hash = await hashPassword(body.password);
     const result = await query(
       `INSERT INTO users (email, password_hash, name, role, email_verified, email_verified_at)
        VALUES (:email, :password_hash, :name, :role, 1, NOW())`,
       { email, password_hash, name: body.name, role }
     );
 
-    if (isFirstUser) {
-      await ensurePrimaryAdminIntegrity();
-    }
+    if (isFirstUser) invalidatePrimaryAdminCache();
 
-    try {
-      const { ensureUserWallet } = await import('../services/wallet.service.js');
-      await ensureUserWallet(result.insertId);
-    } catch {
-      /* lazy */
-    }
+    // Best-effort cleanup of legacy pending_signups — do not block the response
+    query('DELETE FROM pending_signups WHERE email = :email', { email }).catch(() => {});
 
-    const users = await query(`SELECT ${USER_PUBLIC_FIELDS} FROM users WHERE id = :id LIMIT 1`, {
+    const user = {
       id: result.insertId,
-    });
-    const tokens = await createSession(users[0]);
+      email,
+      name: body.name,
+      role,
+      avatar_url: null,
+      phone: null,
+      language: null,
+      timezone: null,
+      date_format: null,
+      bio: null,
+      email_verified: 1,
+      email_verified_at: new Date().toISOString(),
+      is_active: 1,
+      is_primary_admin: isFirstUser,
+    };
+    const tokens = await createSession(user);
 
     res.status(201).json({
       success: true,
-      data: { user: users[0], ...tokens },
+      data: { user, ...tokens },
     });
   })
 );
@@ -178,29 +190,20 @@ router.post(
     const ok = await bcrypt.compare(body.password, user.password_hash);
     if (!ok) throw new AppError('Invalid credentials', 401, 'INVALID_CREDENTIALS');
 
-    // Auto-mark legacy unverified accounts as verified (email codes disabled)
+    // Legacy unverified accounts — mark verified without blocking login response
     if (!user.email_verified) {
-      await query(
+      query(
         `UPDATE users SET email_verified = 1, email_verified_at = COALESCE(email_verified_at, NOW()) WHERE id = :id`,
         { id: user.id }
-      );
+      ).catch(() => {});
       user.email_verified = 1;
-      user.email_verified_at = user.email_verified_at || new Date();
     }
 
-    // Ensure the earliest account stays admin, then return fresh role from DB
-    await ensurePrimaryAdminIntegrity();
+    const { password_hash: _ph, ...rest } = user;
     const primaryAdminId = await getPrimaryAdminId();
-    const fresh = await query(`SELECT ${USER_PUBLIC_FIELDS} FROM users WHERE id = :id LIMIT 1`, {
-      id: user.id,
-    });
-    const base = fresh[0] || (() => {
-      const { password_hash: _ph, ...rest } = user;
-      return rest;
-    })();
     const safe = {
-      ...base,
-      is_primary_admin: Number(base.id) === Number(primaryAdminId),
+      ...rest,
+      is_primary_admin: Number(rest.id) === Number(primaryAdminId),
     };
     const tokens = await createSession(safe);
 
@@ -310,7 +313,7 @@ router.post(
     );
     if (!rows.length) throw new AppError('Invalid or expired reset token', 400, 'INVALID_TOKEN');
 
-    const password_hash = await bcrypt.hash(body.password, 12);
+    const password_hash = await hashPassword(body.password);
     await query('UPDATE users SET password_hash = :password_hash WHERE id = :id', {
       password_hash,
       id: rows[0].user_id,
@@ -337,7 +340,7 @@ router.post(
     const ok = await bcrypt.compare(body.currentPassword, users[0].password_hash);
     if (!ok) throw new AppError('Current password is incorrect', 400);
 
-    const password_hash = await bcrypt.hash(body.newPassword, 12);
+    const password_hash = await hashPassword(body.newPassword);
     await query('UPDATE users SET password_hash = :password_hash WHERE id = :id', {
       password_hash,
       id: req.user.id,
@@ -350,11 +353,12 @@ router.get(
   '/me',
   authenticate,
   asyncHandler(async (req, res) => {
-    await ensurePrimaryAdminIntegrity();
-    const primaryAdminId = await getPrimaryAdminId();
-    const users = await query(`SELECT ${USER_PUBLIC_FIELDS} FROM users WHERE id = :id LIMIT 1`, {
-      id: req.user.id,
-    });
+    const [users, primaryAdminId] = await Promise.all([
+      query(`SELECT ${USER_PUBLIC_FIELDS} FROM users WHERE id = :id LIMIT 1`, {
+        id: req.user.id,
+      }),
+      getPrimaryAdminId(),
+    ]);
     const user = users[0] || req.user;
     res.json({
       success: true,
@@ -517,7 +521,6 @@ router.get(
   authenticate,
   requireRole('admin'),
   asyncHandler(async (req, res) => {
-    await ensurePrimaryAdminIntegrity();
     const primaryAdminId = await getPrimaryAdminId();
     const rows = await query(
       `SELECT ${USER_PUBLIC_FIELDS}, created_at FROM users ORDER BY id ASC`
@@ -548,7 +551,7 @@ router.post(
     const existing = await query('SELECT id FROM users WHERE email = :email LIMIT 1', { email });
     if (existing.length) throw new AppError('Email already registered', 409, 'EMAIL_EXISTS');
 
-    const password_hash = await bcrypt.hash(body.password, 12);
+    const password_hash = await hashPassword(body.password);
     const result = await query(
       `INSERT INTO users (email, password_hash, name, role, is_active, email_verified, email_verified_at)
        VALUES (:email, :password_hash, :name, :role, :is_active, 1, NOW())`,
@@ -561,17 +564,22 @@ router.post(
       }
     );
 
-    try {
-      const { ensureUserWallet } = await import('../services/wallet.service.js');
-      await ensureUserWallet(result.insertId);
-    } catch {
-      /* lazy */
-    }
-
     const created = await query(
       `SELECT ${USER_PUBLIC_FIELDS}, created_at FROM users WHERE id = :id LIMIT 1`,
       { id: result.insertId }
     );
+    emitWorkspaceChanged({
+      resource: 'users',
+      action: 'created',
+      actorUserId: req.user.id,
+      entityId: result.insertId,
+    });
+    emitWorkspaceChanged({
+      resource: 'groups',
+      action: 'updated',
+      actorUserId: req.user.id,
+      meta: { reason: 'shareable_members_changed' },
+    });
     res.status(201).json({ success: true, data: { user: created[0] } });
   })
 );
@@ -640,7 +648,7 @@ router.patch(
     }
     if (body.password) {
       fields.push('password_hash = :password_hash');
-      params.password_hash = await bcrypt.hash(body.password, 12);
+      params.password_hash = await hashPassword(body.password);
     }
 
     if (!fields.length) {
@@ -658,6 +666,18 @@ router.patch(
       `SELECT ${USER_PUBLIC_FIELDS}, created_at FROM users WHERE id = :id LIMIT 1`,
       { id: userId }
     );
+    emitWorkspaceChanged({
+      resource: 'users',
+      action: 'updated',
+      actorUserId: req.user.id,
+      entityId: userId,
+    });
+    emitWorkspaceChanged({
+      resource: 'groups',
+      action: 'updated',
+      actorUserId: req.user.id,
+      meta: { reason: 'shareable_members_changed' },
+    });
     res.json({
       success: true,
       data: {
@@ -730,6 +750,19 @@ router.patch(
       `SELECT ${USER_PUBLIC_FIELDS}, created_at FROM users WHERE id = :id LIMIT 1`,
       { id: userId }
     );
+    emitWorkspaceChanged({
+      resource: 'users',
+      action: 'updated',
+      actorUserId: req.user.id,
+      entityId: userId,
+      meta: { role },
+    });
+    emitWorkspaceChanged({
+      resource: 'groups',
+      action: 'updated',
+      actorUserId: req.user.id,
+      meta: { reason: 'shareable_members_changed' },
+    });
     res.json({
       success: true,
       data: {

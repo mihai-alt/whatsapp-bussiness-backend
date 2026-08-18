@@ -1,14 +1,10 @@
 /**
- * Contact Group access control (ownership + PRIVATE/SHARED + ACTIVE/INACTIVE).
+ * Contact Group access control (ownership + PRIVATE/SHARED + per-member grants).
  *
- * Naming note:
- * - contact_group_members  = contacts inside a group (existing)
- * - contact_group_access    = legacy optional grant table (not required for SHARED)
- *
- * SHARED means every authenticated Member in the org can view and use the group.
- * PRIVATE means only Admin + Owner.
- *
- * Single-business app: no business_id column. All authenticated users share one org.
+ * - PRIVATE: Admin + Owner + users in contact_group_access
+ * - SHARED: every authenticated Member (org-wide)
+ * - Owners (and admins) may grant/revoke Members (never Admins) via contact_group_access
+ * - contact_group_members = contacts inside a group (phone numbers), not site users
  */
 import { AppError } from '../middleware/error.js';
 import { query } from '../db/pool.js';
@@ -42,13 +38,26 @@ export function isSharedGroup(group) {
   return normalizeAccessMode(group?.access_mode) === GROUP_ACCESS_MODE.SHARED;
 }
 
+export async function hasExplicitGroupAccess(userId, groupId) {
+  const uid = Number(userId);
+  const gid = Number(groupId);
+  if (!uid || !gid) return false;
+  const rows = await query(
+    `SELECT 1 AS ok FROM contact_group_access
+     WHERE group_id = :group_id AND user_id = :user_id
+     LIMIT 1`,
+    { group_id: gid, user_id: uid }
+  );
+  return rows.length > 0;
+}
+
 /** View group metadata / contacts list */
 export async function canViewContactGroup(user, group) {
   if (!user || !group) return false;
   if (isAdminUser(user)) return true;
   if (isGroupOwner(user, group)) return true;
-  // SHARED: every Member can view / join (use) the group
-  return isSharedGroup(group);
+  if (isSharedGroup(group)) return true;
+  return hasExplicitGroupAccess(user.id, group.id);
 }
 
 /** Edit name/description/status/access_mode; delete group */
@@ -58,7 +67,7 @@ export function canManageContactGroup(user, group) {
   return isGroupOwner(user, group);
 }
 
-/** Change access mode (Private ↔ Shared) — owner/admin only */
+/** Grant/revoke Members — owner/admin only */
 export function canManageContactGroupAccess(user, group) {
   return canManageContactGroup(user, group);
 }
@@ -77,7 +86,7 @@ export async function canRemoveContactsFromGroup(user, group) {
   if (!user || !group) return false;
   if (isAdminUser(user) || isGroupOwner(user, group)) return true;
   if (!isGroupActive(group)) return false;
-  return isSharedGroup(group);
+  return canViewContactGroup(user, group);
 }
 
 /** Contact edit: owner only — Admin may view/delete but not edit */
@@ -245,13 +254,20 @@ export async function assertCanManageGroupIds(user, groupIds) {
 /**
  * List groups the user can view.
  * Admin: all.
- * Member: own groups OR any SHARED group in the org.
+ * Member: own groups OR SHARED OR explicitly granted via contact_group_access.
  */
 export async function listViewableGroups(user) {
   const params = {};
   let where = '1=1';
   if (!isAdminUser(user)) {
-    where += ` AND (g.created_by = :uid OR g.access_mode = 'SHARED')`;
+    where += ` AND (
+      g.created_by = :uid
+      OR g.access_mode = 'SHARED'
+      OR EXISTS (
+        SELECT 1 FROM contact_group_access ca
+        WHERE ca.group_id = g.id AND ca.user_id = :uid
+      )
+    )`;
     params.uid = user.id;
   }
 
@@ -291,11 +307,13 @@ export async function listGroupAccessUsers(groupId) {
      FROM contact_group_access a
      JOIN users u ON u.id = a.user_id
      WHERE a.group_id = :group_id
+       AND u.role = 'member'
      ORDER BY u.name ASC`,
     { group_id: groupId }
   );
 }
 
+/** Site members (non-admin) that can still be added to this group. */
 export async function listShareableMembers(group) {
   return query(
     `SELECT u.id, u.name, u.email, u.role
@@ -303,16 +321,17 @@ export async function listShareableMembers(group) {
      WHERE u.role = 'member'
        AND u.is_active = 1
        AND u.id <> :owner_id
+       AND NOT EXISTS (
+         SELECT 1 FROM contact_group_access a
+         WHERE a.group_id = :group_id AND a.user_id = u.id
+       )
      ORDER BY u.name ASC`,
-    { owner_id: group.created_by || 0 }
+    { owner_id: group.created_by || 0, group_id: group.id }
   );
 }
 
 export async function grantGroupAccess(group, targetUserId, actor) {
   assertCanManageContactGroupAccess(actor, group);
-  if (!isSharedGroup(group)) {
-    throw new AppError('Switch the group to Shared before granting access', 400, 'NOT_SHARED');
-  }
   const uid = Number(targetUserId);
   if (!uid) throw new AppError('Invalid user', 400);
   if (Number(group.created_by) === uid) {
@@ -324,7 +343,7 @@ export async function grantGroupAccess(group, targetUserId, actor) {
   );
   if (!users.length) throw new AppError('User not found', 404);
   if (users[0].role === 'admin') {
-    throw new AppError('Admins already have access to all groups', 400, 'ADMIN_ACCESS');
+    throw new AppError('Administrators already have access to all groups', 400, 'ADMIN_ACCESS');
   }
   await query(
     `INSERT IGNORE INTO contact_group_access (group_id, user_id) VALUES (:group_id, :user_id)`,
@@ -336,6 +355,12 @@ export async function revokeGroupAccess(group, targetUserId, actor) {
   assertCanManageContactGroupAccess(actor, group);
   if (Number(targetUserId) === Number(group.created_by)) {
     throw new AppError('Cannot remove the group owner', 400, 'OWNER_ACCESS');
+  }
+  const users = await query(`SELECT id, role FROM users WHERE id = :id LIMIT 1`, {
+    id: targetUserId,
+  });
+  if (users[0]?.role === 'admin') {
+    throw new AppError('Cannot revoke administrator access', 400, 'ADMIN_ACCESS');
   }
   await query(
     `DELETE FROM contact_group_access WHERE group_id = :group_id AND user_id = :user_id`,
@@ -349,7 +374,7 @@ export async function clearGroupAccess(groupId) {
   });
 }
 
-/** Group IDs where the member may add/remove contacts (owned + all SHARED ACTIVE). */
+/** Group IDs where the member may add/remove contacts (owned + SHARED + granted ACTIVE). */
 export async function listContactEditableGroupIds(user) {
   if (isAdminUser(user)) {
     const rows = await query(`SELECT id FROM contact_groups`);
@@ -359,7 +384,11 @@ export async function listContactEditableGroupIds(user) {
     `SELECT g.id
      FROM contact_groups g
      WHERE g.created_by = :uid
-        OR (g.access_mode = 'SHARED' AND g.status = 'ACTIVE')`,
+        OR (g.access_mode = 'SHARED' AND g.status = 'ACTIVE')
+        OR EXISTS (
+          SELECT 1 FROM contact_group_access ca
+          WHERE ca.group_id = g.id AND ca.user_id = :uid
+        )`,
     { uid: user.id }
   );
   return rows.map((r) => Number(r.id));

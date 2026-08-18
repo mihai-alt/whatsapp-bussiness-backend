@@ -662,6 +662,13 @@ router.post(
     });
 
     const updated = await loadCampaignOrThrow(campaign.id);
+    emitWorkspaceChanged({
+      resource: 'campaigns',
+      action: 'updated',
+      actorUserId: req.user.id,
+      entityId: campaign.id,
+      meta: { status: updated.status, reason: 'approved' },
+    });
     res.json({
       success: true,
       data: {
@@ -767,6 +774,13 @@ router.post(
     });
 
     const updated = await loadCampaignOrThrow(campaign.id);
+    emitWorkspaceChanged({
+      resource: 'campaigns',
+      action: 'updated',
+      actorUserId: req.user.id,
+      entityId: campaign.id,
+      meta: { status: updated.status, reason: 'launched' },
+    });
     res.json({
       success: true,
       data: {
