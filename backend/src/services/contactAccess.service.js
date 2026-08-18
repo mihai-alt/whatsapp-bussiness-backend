@@ -4,6 +4,7 @@
  * - PRIVATE: Admin + Owner + users in contact_group_access
  * - SHARED: every authenticated Member (org-wide)
  * - Owners (and admins) may grant/revoke Members (never Admins) via contact_group_access
+ * - Add-all grants every remaining active Member except the owner and administrators
  * - contact_group_members = contacts inside a group (phone numbers), not site users
  */
 import { AppError } from '../middleware/error.js';
@@ -313,6 +314,21 @@ export async function listGroupAccessUsers(groupId) {
   );
 }
 
+function skipGrantReason(group, user) {
+  if (!user) return { code: 'NOT_FOUND', message: 'User not found' };
+  if (!Number(user.is_active)) return { code: 'INACTIVE_USER', message: 'User is inactive' };
+  if (user.role === 'admin') {
+    return { code: 'ADMIN_ACCESS', message: 'Administrators already have access to all groups' };
+  }
+  if (user.role !== 'member') {
+    return { code: 'NOT_MEMBER', message: 'Only site members can be added to a group' };
+  }
+  if (Number(group.created_by) === Number(user.id)) {
+    return { code: 'OWNER_ACCESS', message: 'Owner already has access' };
+  }
+  return null;
+}
+
 /** Site members (non-admin) that can still be added to this group. */
 export async function listShareableMembers(group) {
   return query(
@@ -330,42 +346,116 @@ export async function listShareableMembers(group) {
   );
 }
 
+export async function getGroupAccessPayload(actor, group) {
+  const [users, shareable, decorated] = await Promise.all([
+    listGroupAccessUsers(group.id),
+    listShareableMembers(group),
+    decorateGroupFlags(actor, group),
+  ]);
+  return { group: decorated, users, shareable };
+}
+
 export async function grantGroupAccess(group, targetUserId, actor) {
   assertCanManageContactGroupAccess(actor, group);
   const uid = Number(targetUserId);
   if (!uid) throw new AppError('Invalid user', 400);
-  if (Number(group.created_by) === uid) {
-    throw new AppError('Owner already has access', 400, 'OWNER_ACCESS');
-  }
   const users = await query(
-    `SELECT id, role FROM users WHERE id = :id AND is_active = 1 LIMIT 1`,
+    `SELECT id, role, is_active FROM users WHERE id = :id LIMIT 1`,
     { id: uid }
   );
-  if (!users.length) throw new AppError('User not found', 404);
-  if (users[0].role === 'admin') {
-    throw new AppError('Administrators already have access to all groups', 400, 'ADMIN_ACCESS');
-  }
+  if (!users.length) throw new AppError('User not found', 404, 'NOT_FOUND');
+  const reason = skipGrantReason(group, users[0]);
+  if (reason) throw new AppError(reason.message, 400, reason.code);
   await query(
     `INSERT IGNORE INTO contact_group_access (group_id, user_id) VALUES (:group_id, :user_id)`,
     { group_id: group.id, user_id: uid }
+  );
+  return uid;
+}
+
+/**
+ * Grant many members at once. Admins, the owner, inactive users, and missing
+ * ids are skipped instead of failing the whole batch.
+ */
+export async function grantGroupAccessMany(group, targetUserIds, actor) {
+  assertCanManageContactGroupAccess(actor, group);
+  const unique = [...new Set((targetUserIds || []).map((id) => Number(id)).filter((id) => id > 0))];
+  if (!unique.length) return { granted: [], skipped: [] };
+
+  const placeholders = unique.map((_, i) => `:id${i}`).join(', ');
+  const params = Object.fromEntries(unique.map((id, i) => [`id${i}`, id]));
+  const users = await query(
+    `SELECT id, role, is_active FROM users WHERE id IN (${placeholders})`,
+    params
+  );
+  const byId = new Map(users.map((u) => [Number(u.id), u]));
+  const granted = [];
+  const skipped = [];
+
+  for (const uid of unique) {
+    const reason = skipGrantReason(group, byId.get(uid) || null);
+    if (reason) {
+      skipped.push({ userId: uid, ...reason });
+      continue;
+    }
+    granted.push(uid);
+  }
+
+  if (granted.length) {
+    const values = granted.map((_, i) => `(:group_id, :uid${i})`).join(', ');
+    const insertParams = { group_id: group.id };
+    granted.forEach((id, i) => {
+      insertParams[`uid${i}`] = id;
+    });
+    await query(
+      `INSERT IGNORE INTO contact_group_access (group_id, user_id) VALUES ${values}`,
+      insertParams
+    );
+  }
+
+  return { granted, skipped };
+}
+
+/** Add every remaining active site member except administrators and the owner. */
+export async function grantAllEligibleMembers(group, actor) {
+  assertCanManageContactGroupAccess(actor, group);
+  const eligible = await listShareableMembers(group);
+  if (!eligible.length) return { granted: [], skipped: [] };
+  return grantGroupAccessMany(
+    group,
+    eligible.map((u) => u.id),
+    actor
   );
 }
 
 export async function revokeGroupAccess(group, targetUserId, actor) {
   assertCanManageContactGroupAccess(actor, group);
-  if (Number(targetUserId) === Number(group.created_by)) {
+  const uid = Number(targetUserId);
+  if (!uid) throw new AppError('Invalid user', 400);
+  if (Number(group.created_by) === uid) {
     throw new AppError('Cannot remove the group owner', 400, 'OWNER_ACCESS');
   }
   const users = await query(`SELECT id, role FROM users WHERE id = :id LIMIT 1`, {
-    id: targetUserId,
+    id: uid,
   });
-  if (users[0]?.role === 'admin') {
+  if (!users.length) throw new AppError('User not found', 404, 'NOT_FOUND');
+  if (users[0].role === 'admin') {
     throw new AppError('Cannot revoke administrator access', 400, 'ADMIN_ACCESS');
+  }
+  const existing = await query(
+    `SELECT 1 AS ok FROM contact_group_access
+     WHERE group_id = :group_id AND user_id = :user_id
+     LIMIT 1`,
+    { group_id: group.id, user_id: uid }
+  );
+  if (!existing.length) {
+    throw new AppError('Member is not in this group', 404, 'NOT_IN_GROUP');
   }
   await query(
     `DELETE FROM contact_group_access WHERE group_id = :group_id AND user_id = :user_id`,
-    { group_id: group.id, user_id: targetUserId }
+    { group_id: group.id, user_id: uid }
   );
+  return uid;
 }
 
 export async function clearGroupAccess(groupId) {

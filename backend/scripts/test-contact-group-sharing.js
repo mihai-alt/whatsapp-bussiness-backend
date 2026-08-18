@@ -204,6 +204,112 @@ async function main() {
     fail('TEST 9 Private again: Member B denied', e);
   }
 
+  // TEST 9b: owner can list shareable members (no admins)
+  try {
+    const { status, json } = await api('GET', `/api/contacts/groups/${groupA.id}/access`, {
+      token: memberAToken,
+    });
+    assert(status === 200, `owner access list ${status} ${JSON.stringify(json)}`);
+    assert(json.data?.group?.can_manage_access === true, 'owner can_manage_access');
+    assert(json.data?.group?.is_owner === true, 'owner is_owner');
+    const shareable = json.data?.shareable || [];
+    assert(
+      shareable.every((u) => String(u.role) === 'member'),
+      'shareable must not include administrators'
+    );
+    assert(
+      shareable.some((u) => Number(u.id) === Number(memberBId)),
+      'Member B should be addable'
+    );
+    const asB = await api('GET', `/api/contacts/groups/${groupA.id}/access`, {
+      token: memberBToken,
+    });
+    assert(asB.status === 403, `non-owner access list ${asB.status}`);
+    pass('TEST 9b Owner lists addable members (admins excluded)');
+  } catch (e) {
+    fail('TEST 9b Owner lists addable members (admins excluded)', e);
+  }
+
+  // TEST 9c: owner cannot add an administrator
+  try {
+    const admins = await query(`SELECT id FROM users WHERE role = 'admin' AND is_active = 1 LIMIT 1`);
+    assert(admins.length === 1, 'need an admin to reject');
+    const { status, json } = await api('POST', `/api/contacts/groups/${groupA.id}/access`, {
+      token: memberAToken,
+      body: { userId: admins[0].id },
+    });
+    assert(status === 400, `expected 400 adding admin got ${status} ${JSON.stringify(json)}`);
+    pass('TEST 9c Owner cannot add administrator');
+  } catch (e) {
+    fail('TEST 9c Owner cannot add administrator', e);
+  }
+
+  // TEST 9d: owner adds a member, then removes them
+  try {
+    const add = await api('POST', `/api/contacts/groups/${groupA.id}/access`, {
+      token: memberAToken,
+      body: { userId: memberBId },
+    });
+    assert(add.status === 201, `grant B ${add.status} ${JSON.stringify(add.json)}`);
+    const invited = (add.json.data?.users || []).map((u) => Number(u.id));
+    assert(invited.includes(Number(memberBId)), 'B listed in members');
+    assert(
+      !(add.json.data?.shareable || []).some((u) => Number(u.id) === Number(memberBId)),
+      'B no longer shareable'
+    );
+    const view = await api('GET', `/api/contacts/groups/${groupA.id}`, { token: memberBToken });
+    assert(view.status === 200, `B can view after grant ${view.status}`);
+
+    const asB = await api('POST', `/api/contacts/groups/${groupA.id}/access`, {
+      token: memberBToken,
+      body: { userId: memberAId },
+    });
+    assert(asB.status === 403, `non-owner grant ${asB.status}`);
+
+    const rem = await api('DELETE', `/api/contacts/groups/${groupA.id}/access/${memberBId}`, {
+      token: memberAToken,
+    });
+    assert(rem.status === 200, `revoke B ${rem.status} ${JSON.stringify(rem.json)}`);
+    assert(
+      !(rem.json.data?.users || []).some((u) => Number(u.id) === Number(memberBId)),
+      'B removed from members'
+    );
+    const viewAfter = await api('GET', `/api/contacts/groups/${groupA.id}`, { token: memberBToken });
+    assert(viewAfter.status === 403, `B denied after revoke ${viewAfter.status}`);
+    pass('TEST 9d Owner add then remove member');
+  } catch (e) {
+    fail('TEST 9d Owner add then remove member', e);
+  }
+
+  // TEST 9e: add all remaining members except admins
+  try {
+    const bulk = await api('POST', `/api/contacts/groups/${groupA.id}/access/all`, {
+      token: memberAToken,
+    });
+    assert(bulk.status === 201, `add all ${bulk.status} ${JSON.stringify(bulk.json)}`);
+    const users = bulk.json.data?.users || [];
+    assert(users.every((u) => String(u.role) === 'member'), 'added users are members only');
+    assert(
+      !users.some((u) => Number(u.id) === Number(memberAId)),
+      'owner is not in invited members list'
+    );
+    assert(
+      users.some((u) => Number(u.id) === Number(memberBId)),
+      'Member B included in add-all'
+    );
+    assert((bulk.json.data?.shareable || []).length === 0, 'no members left to add');
+    const view = await api('GET', `/api/contacts/groups/${groupA.id}`, { token: memberBToken });
+    assert(view.status === 200, `B can view after add-all ${view.status}`);
+
+    const rem = await api('DELETE', `/api/contacts/groups/${groupA.id}/access/${memberBId}`, {
+      token: memberAToken,
+    });
+    assert(rem.status === 200, `remove after add-all ${rem.status}`);
+    pass('TEST 9e Owner add-all members except admins');
+  } catch (e) {
+    fail('TEST 9e Owner add-all members except admins', e);
+  }
+
   // Re-share then PRIVATE wipe (legacy clear)
   try {
     await api('PATCH', `/api/contacts/groups/${groupA.id}`, {

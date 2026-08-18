@@ -29,9 +29,10 @@ import {
   loadContactGroupOrThrow,
   listViewableGroups,
   listUsableGroups,
-  listGroupAccessUsers,
-  listShareableMembers,
+  getGroupAccessPayload,
   grantGroupAccess,
+  grantGroupAccessMany,
+  grantAllEligibleMembers,
   revokeGroupAccess,
   listContactEditableGroupIds,
   GROUP_ACCESS_MODE,
@@ -572,19 +573,126 @@ router.get(
   })
 );
 
+async function notifyAccessGranted(req, group, grantedIds, { bulk = false } = {}) {
+  const ids = [...new Set((grantedIds || []).map((id) => Number(id)).filter((id) => id > 0))];
+  if (!ids.length) return;
+
+  let targetName = 'a member';
+  if (!bulk && ids.length === 1) {
+    const target = await query(`SELECT name FROM users WHERE id = :id LIMIT 1`, { id: ids[0] });
+    targetName = target[0]?.name || 'a member';
+  }
+
+  await notifyProjectEvent({
+    type: 'group_access_granted',
+    title: bulk ? 'Group members added' : 'Group access granted',
+    body: bulk
+      ? `${req.user.name || 'A user'} added ${ids.length} member${ids.length === 1 ? '' : 's'} to "${group.name}".`
+      : `${req.user.name || 'A user'} granted ${targetName} access to "${group.name}".`,
+    meta: {
+      groupId: group.id,
+      targetUserId: bulk ? undefined : ids[0],
+      granted: bulk ? ids : undefined,
+      grantedBy: req.user.id,
+    },
+    relatedUserIds: [...ids, Number(group.created_by || 0)].filter((id) => id > 0),
+    actorUserId: req.user.id,
+  });
+  emitWorkspaceChanged({
+    resource: 'groups',
+    action: 'access_granted',
+    actorUserId: req.user.id,
+    entityId: group.id,
+    meta: bulk ? { granted: ids } : { targetUserId: ids[0] },
+  });
+  for (const uid of ids) {
+    emitToUser(uid, 'workspace:changed', {
+      resource: 'groups',
+      action: 'access_granted',
+      actorUserId: req.user.id,
+      entityId: group.id,
+      meta: { targetUserId: uid },
+      at: new Date().toISOString(),
+    });
+  }
+}
+
+async function notifyAccessRevoked(req, group, targetUserId, targetName) {
+  await notifyProjectEvent({
+    type: 'group_access_revoked',
+    title: 'Group access revoked',
+    body: `${req.user.name || 'A user'} revoked ${targetName || 'a member'}'s access to "${group.name}".`,
+    meta: {
+      groupId: group.id,
+      targetUserId,
+      revokedBy: req.user.id,
+    },
+    relatedUserIds: [targetUserId, Number(group.created_by || 0)].filter((id) => id > 0),
+    actorUserId: req.user.id,
+  });
+  emitWorkspaceChanged({
+    resource: 'groups',
+    action: 'access_revoked',
+    actorUserId: req.user.id,
+    entityId: group.id,
+    meta: { targetUserId },
+  });
+  emitToUser(targetUserId, 'workspace:changed', {
+    resource: 'groups',
+    action: 'access_revoked',
+    actorUserId: req.user.id,
+    entityId: group.id,
+    meta: { targetUserId },
+    at: new Date().toISOString(),
+  });
+}
+
 router.get(
   '/groups/:id/access',
   asyncHandler(async (req, res) => {
     const group = await loadContactGroupOrThrow(req.params.id);
     assertCanManageContactGroupAccess(req.user, group);
-    const users = await listGroupAccessUsers(group.id);
-    const shareable = await listShareableMembers(group);
     res.json({
       success: true,
+      data: await getGroupAccessPayload(req.user, group),
+    });
+  })
+);
+
+/** Add every remaining site member except administrators and the owner. */
+router.post(
+  '/groups/:id/access/all',
+  asyncHandler(async (req, res) => {
+    const group = await loadContactGroupOrThrow(req.params.id);
+    const { granted, skipped } = await grantAllEligibleMembers(group, req.user);
+    await notifyAccessGranted(req, group, granted, { bulk: true });
+    res.status(201).json({
+      success: true,
       data: {
-        group: await decorateGroupFlags(req.user, group),
-        users,
-        shareable,
+        ...(await getGroupAccessPayload(req.user, group)),
+        granted,
+        skipped,
+      },
+    });
+  })
+);
+
+router.post(
+  '/groups/:id/access/bulk',
+  asyncHandler(async (req, res) => {
+    const schema = z.object({
+      userIds: z.array(z.coerce.number().int().positive()).min(1).max(500),
+    });
+    const body = schema.parse(req.body);
+    const group = await loadContactGroupOrThrow(req.params.id);
+    const { granted, skipped } = await grantGroupAccessMany(group, body.userIds, req.user);
+    await notifyAccessGranted(req, group, granted, { bulk: true });
+    res.status(201).json({
+      success: true,
+      data: {
+        ...(await getGroupAccessPayload(req.user, group)),
+        granted,
+        skipped,
       },
     });
   })
@@ -593,47 +701,41 @@ router.get(
 router.post(
   '/groups/:id/access',
   asyncHandler(async (req, res) => {
-    const schema = z.object({
-      userId: z.coerce.number().int().positive(),
-    });
-    const body = schema.parse(req.body);
+    const schema = z
+      .object({
+        userId: z.coerce.number().int().positive().optional(),
+        userIds: z.array(z.coerce.number().int().positive()).max(500).optional(),
+        all: z.boolean().optional(),
+      })
+      .refine((body) => body.all === true || body.userId || (body.userIds && body.userIds.length), {
+        message: 'Provide userId, userIds, or all: true',
+      });
+    const body = schema.parse(req.body || {});
     const group = await loadContactGroupOrThrow(req.params.id);
-    await grantGroupAccess(group, body.userId, req.user);
-    const users = await listGroupAccessUsers(group.id);
 
-    const target = await query(
-      `SELECT id, name FROM users WHERE id = :id AND is_active = 1 LIMIT 1`,
-      { id: body.userId }
-    );
-    await notifyProjectEvent({
-      type: 'group_access_granted',
-      title: 'Group access granted',
-      body: `${req.user.name || 'A user'} granted ${target[0]?.name || 'a member'} access to "${group.name}".`,
-      meta: {
-        groupId: group.id,
-        targetUserId: body.userId,
-        grantedBy: req.user.id,
+    let granted = [];
+    let skipped = [];
+    if (body.all === true) {
+      ({ granted, skipped } = await grantAllEligibleMembers(group, req.user));
+    } else if (body.userIds?.length) {
+      ({ granted, skipped } = await grantGroupAccessMany(group, body.userIds, req.user));
+    } else {
+      const uid = await grantGroupAccess(group, body.userId, req.user);
+      granted = [uid];
+    }
+
+    await notifyAccessGranted(req, group, granted, {
+      bulk: body.all === true || Boolean(body.userIds?.length),
+    });
+
+    res.status(201).json({
+      success: true,
+      data: {
+        ...(await getGroupAccessPayload(req.user, group)),
+        granted,
+        skipped,
       },
-      relatedUserIds: [body.userId, Number(group.created_by || 0)].filter((id) => id > 0),
-      actorUserId: req.user.id,
     });
-    emitWorkspaceChanged({
-      resource: 'groups',
-      action: 'access_granted',
-      actorUserId: req.user.id,
-      entityId: group.id,
-      meta: { targetUserId: body.userId },
-    });
-    emitToUser(body.userId, 'workspace:changed', {
-      resource: 'groups',
-      action: 'access_granted',
-      actorUserId: req.user.id,
-      entityId: group.id,
-      meta: { targetUserId: body.userId },
-      at: new Date().toISOString(),
-    });
-
-    res.status(201).json({ success: true, data: { users } });
   })
 );
 
@@ -642,42 +744,15 @@ router.delete(
   asyncHandler(async (req, res) => {
     const group = await loadContactGroupOrThrow(req.params.id);
     const targetUserId = Number(req.params.userId);
-    const target = await query(
-      `SELECT id, name FROM users WHERE id = :id LIMIT 1`,
-      { id: targetUserId }
-    );
+    const target = await query(`SELECT id, name FROM users WHERE id = :id LIMIT 1`, {
+      id: targetUserId,
+    });
     await revokeGroupAccess(group, targetUserId, req.user);
-    const users = await listGroupAccessUsers(group.id);
-
-    await notifyProjectEvent({
-      type: 'group_access_revoked',
-      title: 'Group access revoked',
-      body: `${req.user.name || 'A user'} revoked ${target[0]?.name || 'a member'}'s access to "${group.name}".`,
-      meta: {
-        groupId: group.id,
-        targetUserId,
-        revokedBy: req.user.id,
-      },
-      relatedUserIds: [targetUserId, Number(group.created_by || 0)].filter((id) => id > 0),
-      actorUserId: req.user.id,
+    await notifyAccessRevoked(req, group, targetUserId, target[0]?.name);
+    res.json({
+      success: true,
+      data: await getGroupAccessPayload(req.user, group),
     });
-    emitWorkspaceChanged({
-      resource: 'groups',
-      action: 'access_revoked',
-      actorUserId: req.user.id,
-      entityId: group.id,
-      meta: { targetUserId },
-    });
-    emitToUser(targetUserId, 'workspace:changed', {
-      resource: 'groups',
-      action: 'access_revoked',
-      actorUserId: req.user.id,
-      entityId: group.id,
-      meta: { targetUserId },
-      at: new Date().toISOString(),
-    });
-
-    res.json({ success: true, data: { users } });
   })
 );
 
