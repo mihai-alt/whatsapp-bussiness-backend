@@ -5,6 +5,7 @@ import { asyncHandler, AppError } from '../middleware/error.js';
 import { query } from '../db/pool.js';
 import { createMessageTemplate, listMessageTemplates, deleteMessageTemplate } from '../services/meta.service.js';
 import { notifyProjectEvent } from '../services/notification.service.js';
+import { emitWorkspaceChanged } from '../realtime.js';
 import { parseJson } from '../utils/helpers.js';
 import { getAccountAccessToken } from '../services/numberConnection.service.js';
 
@@ -276,6 +277,12 @@ router.post(
        WHERE t.id = :id`,
       { id: result.insertId }
     );
+    emitWorkspaceChanged({
+      resource: 'templates',
+      action: 'created',
+      actorUserId: req.user.id,
+      entityId: result.insertId,
+    });
     res.status(201).json({ success: true, data: decorateTemplate(rows[0]) });
   })
 );

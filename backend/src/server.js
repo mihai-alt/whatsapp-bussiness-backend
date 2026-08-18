@@ -53,6 +53,7 @@ io.on('connection', (socket) => {
       }
       socket.data.userId = userId;
       socket.join(`user:${userId}`);
+      socket.join('workspace');
     } catch {
       /* ignore invalid socket auth */
     }
@@ -60,6 +61,10 @@ io.on('connection', (socket) => {
 
   socket.on('subscribe:campaign', (campaignId) => {
     if (campaignId) socket.join(`campaign:${campaignId}`);
+  });
+
+  socket.on('subscribe:workspace', () => {
+    if (socket.data.userId) socket.join('workspace');
   });
 });
 

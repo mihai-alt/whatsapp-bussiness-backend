@@ -40,6 +40,7 @@ import {
   normalizeAccessMode,
 } from '../services/contactAccess.service.js';
 import { notifyProjectEvent } from '../services/notification.service.js';
+import { emitWorkspaceChanged } from '../realtime.js';
 
 const router = Router();
 router.use(authenticate);
@@ -234,6 +235,21 @@ router.post(
       meta: { contactId: result.insertId, createdBy: req.user.id },
       actorUserId: req.user.id,
     });
+    emitWorkspaceChanged({
+      resource: 'contacts',
+      action: 'created',
+      actorUserId: req.user.id,
+      entityId: result.insertId,
+      meta: { groupIds: body.groupIds || [] },
+    });
+    if (body.groupIds?.length) {
+      emitWorkspaceChanged({
+        resource: 'groups',
+        action: 'updated',
+        actorUserId: req.user.id,
+        meta: { reason: 'members_changed', groupIds: body.groupIds },
+      });
+    }
 
     res.status(201).json({ success: true, data: withContactManageFlag(req.user, rows)[0] });
   })
@@ -293,6 +309,20 @@ router.put(
     const rows = await query('SELECT * FROM contacts WHERE id = :id', { id: req.params.id });
     rows[0].custom_fields = parseJson(rows[0].custom_fields, {});
     await attachGroups(rows, req.user);
+    emitWorkspaceChanged({
+      resource: 'contacts',
+      action: 'updated',
+      actorUserId: req.user.id,
+      entityId: Number(req.params.id),
+    });
+    if (body.groupIds !== undefined) {
+      emitWorkspaceChanged({
+        resource: 'groups',
+        action: 'updated',
+        actorUserId: req.user.id,
+        meta: { reason: 'members_changed' },
+      });
+    }
     res.json({ success: true, data: withContactManageFlag(req.user, rows)[0] });
   })
 );
@@ -307,6 +337,18 @@ router.delete(
     assertCanDeleteContact(req.user, existing[0]);
 
     await query('DELETE FROM contacts WHERE id = :id', { id: req.params.id });
+    emitWorkspaceChanged({
+      resource: 'contacts',
+      action: 'deleted',
+      actorUserId: req.user.id,
+      entityId: Number(req.params.id),
+    });
+    emitWorkspaceChanged({
+      resource: 'groups',
+      action: 'updated',
+      actorUserId: req.user.id,
+      meta: { reason: 'members_changed' },
+    });
     res.json({ success: true, data: { message: 'Deleted' } });
   })
 );
@@ -398,6 +440,21 @@ router.post(
         meta: { imported, duplicates, errors, createdBy: req.user.id },
         actorUserId: req.user.id,
       });
+      emitWorkspaceChanged({
+        resource: 'contacts',
+        action: 'imported',
+        actorUserId: req.user.id,
+        meta: { imported, duplicates, errors, groupId: groupId || null },
+      });
+      if (groupId) {
+        emitWorkspaceChanged({
+          resource: 'groups',
+          action: 'updated',
+          actorUserId: req.user.id,
+          entityId: groupId,
+          meta: { reason: 'members_changed' },
+        });
+      }
     }
 
     res.json({ success: true, data: { imported, duplicates, errors, total: records.length } });
@@ -561,6 +618,13 @@ router.post(
       relatedUserIds: [body.userId, Number(group.created_by || 0)].filter((id) => id > 0),
       actorUserId: req.user.id,
     });
+    emitWorkspaceChanged({
+      resource: 'groups',
+      action: 'access_granted',
+      actorUserId: req.user.id,
+      entityId: group.id,
+      meta: { targetUserId: body.userId },
+    });
 
     res.status(201).json({ success: true, data: { users } });
   })
@@ -589,6 +653,13 @@ router.delete(
       },
       relatedUserIds: [targetUserId, Number(group.created_by || 0)].filter((id) => id > 0),
       actorUserId: req.user.id,
+    });
+    emitWorkspaceChanged({
+      resource: 'groups',
+      action: 'access_revoked',
+      actorUserId: req.user.id,
+      entityId: group.id,
+      meta: { targetUserId },
     });
 
     res.json({ success: true, data: { users } });
@@ -626,6 +697,13 @@ router.post(
         body: `${req.user.name || 'A user'} created group "${body.name}".`,
         meta: { groupId: result.insertId, createdBy: req.user.id, accessMode: body.accessMode },
         actorUserId: req.user.id,
+      });
+      emitWorkspaceChanged({
+        resource: 'groups',
+        action: 'created',
+        actorUserId: req.user.id,
+        entityId: result.insertId,
+        meta: { accessMode: normalizeAccessMode(body.accessMode) },
       });
 
       res.status(201).json({
@@ -719,6 +797,17 @@ router.patch(
         relatedUserIds,
         actorUserId: req.user.id,
       });
+      emitWorkspaceChanged({
+        resource: 'groups',
+        action: shared ? 'shared' : 'unshared',
+        actorUserId: req.user.id,
+        entityId: group.id,
+        meta: {
+          accessMode: nextAccess,
+          previousAccessMode: prevAccess,
+          name: groupLabel,
+        },
+      });
     }
 
     const updated = await loadContactGroupOrThrow(group.id);
@@ -730,6 +819,14 @@ router.patch(
       'SELECT COUNT(*) AS c FROM contact_group_access WHERE group_id = :id',
       { id: group.id }
     );
+    if (body.accessMode === undefined || nextAccess === prevAccess) {
+      emitWorkspaceChanged({
+        resource: 'groups',
+        action: 'updated',
+        actorUserId: req.user.id,
+        entityId: group.id,
+      });
+    }
     res.json({
       success: true,
       data: await decorateGroupFlags(req.user, {
@@ -764,6 +861,19 @@ router.post(
         { group_id: group.id, contact_id: contactId }
       );
     }
+    emitWorkspaceChanged({
+      resource: 'groups',
+      action: 'updated',
+      actorUserId: req.user.id,
+      entityId: group.id,
+      meta: { reason: 'members_added' },
+    });
+    emitWorkspaceChanged({
+      resource: 'contacts',
+      action: 'updated',
+      actorUserId: req.user.id,
+      meta: { reason: 'group_members_changed', groupId: group.id },
+    });
     res.json({ success: true, data: { message: 'Members added' } });
   })
 );
@@ -784,6 +894,20 @@ router.delete(
        WHERE group_id = :group_id AND contact_id = :contact_id`,
       { group_id: group.id, contact_id: req.params.contactId }
     );
+    emitWorkspaceChanged({
+      resource: 'groups',
+      action: 'updated',
+      actorUserId: req.user.id,
+      entityId: group.id,
+      meta: { reason: 'member_removed', contactId: Number(req.params.contactId) },
+    });
+    emitWorkspaceChanged({
+      resource: 'contacts',
+      action: 'updated',
+      actorUserId: req.user.id,
+      entityId: Number(req.params.contactId),
+      meta: { reason: 'group_members_changed', groupId: group.id },
+    });
     res.json({ success: true, data: { message: 'Member removed from group' } });
   })
 );
@@ -796,6 +920,19 @@ router.delete(
 
     // CASCADE removes contact_group_members + contact_group_access only
     await query('DELETE FROM contact_groups WHERE id = :id', { id: group.id });
+    emitWorkspaceChanged({
+      resource: 'groups',
+      action: 'deleted',
+      actorUserId: req.user.id,
+      entityId: group.id,
+      meta: { name: group.name, accessMode: group.access_mode },
+    });
+    emitWorkspaceChanged({
+      resource: 'contacts',
+      action: 'updated',
+      actorUserId: req.user.id,
+      meta: { reason: 'group_deleted', groupId: group.id },
+    });
     res.json({ success: true, data: { message: 'Deleted' } });
   })
 );

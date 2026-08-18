@@ -11,6 +11,7 @@ import { config } from '../config.js';
 import { getMessageCost, getWallet } from '../services/wallet.service.js';
 import { notifyProjectEvent } from '../services/notification.service.js';
 import { writeAudit } from '../services/audit.service.js';
+import { emitWorkspaceChanged } from '../realtime.js';
 import { normalizePhone, parseJson } from '../utils/helpers.js';
 import { parseSpreadsheetFile } from '../utils/spreadsheet.js';
 import {
@@ -593,6 +594,13 @@ router.post(
       meta: { status, name: body.name.trim() },
       ip: req.ip,
     });
+    emitWorkspaceChanged({
+      resource: 'campaigns',
+      action: 'created',
+      actorUserId: req.user.id,
+      entityId: campaignId,
+      meta: { status },
+    });
     res.status(201).json({ success: true, data: created });
   })
 );
@@ -781,6 +789,13 @@ router.post(
     await drainCampaignJobs(campaign.id, { removeScheduled: true });
     await refreshCampaignStatus(campaign.id);
     res.json({ success: true, data: { message: 'Campaign paused', status: 'paused' } });
+    emitWorkspaceChanged({
+      resource: 'campaigns',
+      action: 'updated',
+      actorUserId: req.user.id,
+      entityId: Number(req.params.id),
+      meta: { status: 'paused' },
+    });
   })
 );
 
@@ -799,6 +814,13 @@ router.post(
     await query(`UPDATE campaigns SET status = 'running' WHERE id = :id`, { id: campaign.id });
     await refreshCampaignStatus(campaign.id);
     res.json({ success: true, data: { message: 'Campaign resumed', status: 'running' } });
+    emitWorkspaceChanged({
+      resource: 'campaigns',
+      action: 'updated',
+      actorUserId: req.user.id,
+      entityId: Number(req.params.id),
+      meta: { status: 'running' },
+    });
   })
 );
 
@@ -821,6 +843,13 @@ router.post(
     await drainCampaignJobs(campaign.id, { removeScheduled: true });
     await refreshCampaignStatus(Number(campaign.id));
     res.json({ success: true, data: { message: 'Campaign cancelled', status: 'cancelled' } });
+    emitWorkspaceChanged({
+      resource: 'campaigns',
+      action: 'updated',
+      actorUserId: req.user.id,
+      entityId: Number(req.params.id),
+      meta: { status: 'cancelled' },
+    });
   })
 );
 
