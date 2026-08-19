@@ -22,6 +22,7 @@ import { config } from '../config.js';
 import { USER_PUBLIC_FIELDS } from '../constants/userFields.js';
 import {
   assertOnlyPrimaryAdminMayChangeAdminAuthority,
+  assertOnlyPrimaryAdminMaySetOtherAdminPassword,
   assertPrimaryAdminRoleStatusImmutable,
   getPrimaryAdminId,
   invalidatePrimaryAdminCache,
@@ -628,6 +629,7 @@ router.patch(
       role: body.role,
       is_active: body.is_active,
     });
+    await assertOnlyPrimaryAdminMaySetOtherAdminPassword(req.user.id, target, body.password);
 
     const nextRole = body.role ?? target.role;
     const nextActive = body.is_active !== undefined ? body.is_active : !!target.is_active;

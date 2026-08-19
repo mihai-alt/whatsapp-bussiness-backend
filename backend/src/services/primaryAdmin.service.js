@@ -49,7 +49,7 @@ export async function ensurePrimaryAdminIntegrity() {
 
 /**
  * Nobody may change the first signup admin's role or status.
- * Other profile fields (name, password) remain editable.
+ * Name remains editable. Password of another admin is primary-only.
  */
 export async function assertPrimaryAdminRoleStatusImmutable(userId, { role, is_active } = {}) {
   if (role === undefined && is_active === undefined) return;
@@ -103,5 +103,22 @@ export async function assertOnlyPrimaryAdminMayChangeAdminAuthority(
       'ADMIN_AUTHORITY_LOCKED'
     );
   }
+}
+
+/**
+ * Remaining admins cannot set another admin's password.
+ * They may still change their own password. Members stay editable by any admin.
+ */
+export async function assertOnlyPrimaryAdminMaySetOtherAdminPassword(actorId, target, password) {
+  if (!password) return;
+  if (String(target?.role) !== 'admin') return;
+  if (Number(actorId) === Number(target.id)) return;
+  if (await isPrimaryAdmin(actorId)) return;
+
+  throw new AppError(
+    "Only the first administrator can set another administrator's password.",
+    403,
+    'ADMIN_PASSWORD_LOCKED'
+  );
 }
 
