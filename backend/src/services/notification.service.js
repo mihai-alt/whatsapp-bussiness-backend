@@ -1,5 +1,6 @@
 import { query } from '../db/pool.js';
 import { getIO } from '../realtime.js';
+import { parseJson } from '../utils/helpers.js';
 
 function emitToUser(userId, notification) {
   try {
@@ -102,7 +103,10 @@ export async function listNotifications({ userId, page = 1, limit = 30 } = {}) {
      ORDER BY id DESC LIMIT :limit OFFSET :offset`,
     { user_id: userId, limit, offset }
   );
-  return rows;
+  return rows.map((row) => ({
+    ...row,
+    meta: parseJson(row.meta, null),
+  }));
 }
 
 export async function countUnreadNotifications(userId) {
