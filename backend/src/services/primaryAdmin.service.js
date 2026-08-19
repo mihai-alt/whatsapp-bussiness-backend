@@ -74,3 +74,34 @@ export async function assertPrimaryAdminRoleStatusImmutable(userId, { role, is_a
     );
   }
 }
+
+function isActiveFlag(value) {
+  return Number(value) === 1 || value === true;
+}
+
+/**
+ * Remaining admins cannot change another admin's role or status.
+ * Only the first registered administrator may do that.
+ */
+export async function assertOnlyPrimaryAdminMayChangeAdminAuthority(
+  actorId,
+  target,
+  { role, is_active } = {}
+) {
+  if (role === undefined && is_active === undefined) return;
+  if (String(target?.role) !== 'admin') return;
+  if (await isPrimaryAdmin(actorId)) return;
+
+  const roleChanging = role !== undefined && role !== target.role;
+  const statusChanging =
+    is_active !== undefined && Boolean(is_active) !== isActiveFlag(target.is_active);
+
+  if (roleChanging || statusChanging) {
+    throw new AppError(
+      "Only the first administrator can change another administrator's role or status.",
+      403,
+      'ADMIN_AUTHORITY_LOCKED'
+    );
+  }
+}
+

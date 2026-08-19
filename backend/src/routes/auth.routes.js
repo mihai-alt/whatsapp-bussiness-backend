@@ -21,6 +21,7 @@ import { emitWorkspaceChanged } from '../realtime.js';
 import { config } from '../config.js';
 import { USER_PUBLIC_FIELDS } from '../constants/userFields.js';
 import {
+  assertOnlyPrimaryAdminMayChangeAdminAuthority,
   assertPrimaryAdminRoleStatusImmutable,
   getPrimaryAdminId,
   invalidatePrimaryAdminCache,
@@ -237,8 +238,18 @@ router.post(
       throw new AppError('Unauthorized', 401);
     }
 
+    const primaryAdminId = await getPrimaryAdminId();
     const accessToken = signAccessToken(users[0]);
-    res.json({ success: true, data: { accessToken, user: users[0] } });
+    res.json({
+      success: true,
+      data: {
+        accessToken,
+        user: {
+          ...users[0],
+          is_primary_admin: Number(users[0].id) === Number(primaryAdminId),
+        },
+      },
+    });
   })
 );
 
@@ -613,6 +624,10 @@ router.patch(
       role: body.role,
       is_active: body.is_active,
     });
+    await assertOnlyPrimaryAdminMayChangeAdminAuthority(req.user.id, target, {
+      role: body.role,
+      is_active: body.is_active,
+    });
 
     const nextRole = body.role ?? target.role;
     const nextActive = body.is_active !== undefined ? body.is_active : !!target.is_active;
@@ -717,6 +732,7 @@ router.patch(
     }
 
     await assertPrimaryAdminRoleStatusImmutable(userId, { role });
+    await assertOnlyPrimaryAdminMayChangeAdminAuthority(req.user.id, target, { role });
 
     if (target.role === 'admin' && role === 'member') {
       const adminCount = await query(
