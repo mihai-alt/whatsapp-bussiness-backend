@@ -1,66 +1,112 @@
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth.js';
 import { asyncHandler } from '../middleware/error.js';
-import { query } from '../db/pool.js';
+import { writeAudit } from '../services/audit.service.js';
+import {
+  exportCampaigns,
+  exportMessages,
+  exportRows,
+  getCampaignReport,
+  getFilterMeta,
+  getMessagePerformance,
+  getOverview,
+  getUsage,
+  listCampaigns,
+  listFailed,
+  listMessages,
+  parseListParams,
+  retryFailedMessages,
+} from '../services/report.service.js';
 
 const router = Router();
 router.use(authenticate);
 
+function filtersFrom(req) {
+  return {
+    range: req.query.range,
+    from: req.query.from,
+    to: req.query.to,
+    whatsappAccountId: req.query.whatsappAccountId || req.query.whatsapp_account_id,
+    campaignId: req.query.campaignId || req.query.campaign_id,
+    templateId: req.query.templateId || req.query.template_id,
+    status: req.query.status,
+    campaignStatus: req.query.campaignStatus || req.query.campaign_status,
+    search: req.query.search || req.query.q,
+    groupBy: req.query.groupBy,
+  };
+}
+
+router.get(
+  '/meta',
+  asyncHandler(async (req, res) => {
+    const data = await getFilterMeta(req.user);
+    res.json({ success: true, data });
+  })
+);
+
+router.get(
+  '/overview',
+  asyncHandler(async (req, res) => {
+    const data = await getOverview(req.user, filtersFrom(req));
+    res.json({ success: true, data });
+  })
+);
+
+router.get(
+  '/message-performance',
+  asyncHandler(async (req, res) => {
+    const data = await getMessagePerformance(req.user, filtersFrom(req));
+    res.json({ success: true, data });
+  })
+);
+
 router.get(
   '/messages',
   asyncHandler(async (req, res) => {
-    const from = req.query.from || null;
-    const to = req.query.to || null;
-    const params = {};
-    let where = '1=1';
-    if (from) {
-      where += ' AND DATE(created_at) >= :from';
-      params.from = from;
-    }
-    if (to) {
-      where += ' AND DATE(created_at) <= :to';
-      params.to = to;
-    }
-
-    const summary = await query(
-      `SELECT
-         SUM(status IN ('sent','delivered','read')) AS sent,
-         SUM(status = 'delivered') AS delivered,
-         SUM(status = 'read') AS \`read\`,
-         SUM(status = 'failed') AS failed,
-         SUM(status IN ('pending','queued')) AS pending,
-         COUNT(*) AS total,
-         SUM(cost) AS total_cost
-       FROM campaign_messages WHERE ${where}`,
-      params
-    );
-
-    const daily = await query(
-      `SELECT DATE(created_at) AS day,
-              SUM(status IN ('sent','delivered','read')) AS sent,
-              SUM(status = 'delivered') AS delivered,
-              SUM(status = 'read') AS \`read\`,
-              SUM(status = 'failed') AS failed
-       FROM campaign_messages WHERE ${where}
-       GROUP BY DATE(created_at)
-       ORDER BY day ASC`,
-      params
-    );
-
+    const paging = parseListParams(req.query);
+    const data = await listMessages(req.user, filtersFrom(req), paging);
     res.json({
       success: true,
-      data: {
-        summary: {
-          sent: Number(summary[0]?.sent || 0),
-          delivered: Number(summary[0]?.delivered || 0),
-          read: Number(summary[0]?.read || 0),
-          failed: Number(summary[0]?.failed || 0),
-          pending: Number(summary[0]?.pending || 0),
-          total: Number(summary[0]?.total || 0),
-          total_cost: Number(summary[0]?.total_cost || 0),
-        },
-        daily,
+      data: data.rows,
+      pagination: {
+        page: data.page,
+        limit: data.limit,
+        total: data.total,
+        totalPages: data.totalPages,
       },
+      meta: { timezone: data.timezone },
+    });
+  })
+);
+
+router.get(
+  '/messages/export',
+  asyncHandler(async (req, res) => {
+    const rows = await exportMessages(req.user, filtersFrom(req));
+    await writeAudit({
+      userId: req.user.id,
+      action: 'report.messages_export',
+      entityType: 'report',
+      meta: { count: rows.length, format: req.query.format || 'csv' },
+      ip: req.ip,
+    });
+    await exportRows({
+      res,
+      filename: `message-report-${Date.now()}`,
+      format: req.query.format,
+      columns: [
+        { header: 'Phone', key: 'phone' },
+        { header: 'Campaign', key: 'campaign_name' },
+        { header: 'Template', key: 'template_name' },
+        { header: 'Status', key: 'status' },
+        { header: 'Sent At', key: 'sent_at' },
+        { header: 'Delivered At', key: 'delivered_at' },
+        { header: 'Read At', key: 'read_at' },
+        { header: 'Failed At', key: 'failed_at' },
+        { header: 'Error', key: 'error_message' },
+        { header: 'Cost', key: 'cost' },
+      ],
+      rows,
     });
   })
 );
@@ -68,14 +114,174 @@ router.get(
 router.get(
   '/campaigns',
   asyncHandler(async (req, res) => {
-    const rows = await query(
-      `SELECT id, name, status, total_count, sent_count, delivered_count, read_count,
-              failed_count, pending_count, total_cost, created_at, completed_at
-       FROM campaigns
-       ORDER BY id DESC
-       LIMIT 200`
+    const paging = parseListParams(req.query);
+    const data = await listCampaigns(req.user, filtersFrom(req), paging);
+    res.json({
+      success: true,
+      data: data.rows,
+      pagination: {
+        page: data.page,
+        limit: data.limit,
+        total: data.total,
+        totalPages: data.totalPages,
+      },
+      meta: { timezone: data.timezone },
+    });
+  })
+);
+
+router.get(
+  '/campaigns/export',
+  asyncHandler(async (req, res) => {
+    const rows = await exportCampaigns(req.user, filtersFrom(req));
+    await writeAudit({
+      userId: req.user.id,
+      action: 'report.campaigns_export',
+      entityType: 'report',
+      meta: { count: rows.length, format: req.query.format || 'csv' },
+      ip: req.ip,
+    });
+    await exportRows({
+      res,
+      filename: `campaign-report-${Date.now()}`,
+      format: req.query.format,
+      columns: [
+        { header: 'Campaign', key: 'name' },
+        { header: 'Template', key: 'template_name' },
+        { header: 'Contacts', key: 'contacts' },
+        { header: 'Sent', key: 'sent' },
+        { header: 'Delivered', key: 'delivered' },
+        { header: 'Read', key: 'read' },
+        { header: 'Failed', key: 'failed' },
+        { header: 'Pending', key: 'pending' },
+        { header: 'Cost', key: 'cost' },
+        { header: 'Status', key: 'status' },
+        { header: 'Created At', key: 'created_at' },
+      ],
+      rows,
+    });
+  })
+);
+
+router.get(
+  '/campaigns/:id',
+  asyncHandler(async (req, res) => {
+    const data = await getCampaignReport(req.user, Number(req.params.id));
+    res.json({ success: true, data });
+  })
+);
+
+router.get(
+  '/failed',
+  asyncHandler(async (req, res) => {
+    const paging = parseListParams(req.query);
+    const data = await listFailed(req.user, filtersFrom(req), paging);
+    res.json({
+      success: true,
+      data: data.rows,
+      pagination: {
+        page: data.page,
+        limit: data.limit,
+        total: data.total,
+        totalPages: data.totalPages,
+      },
+      meta: { timezone: data.timezone },
+    });
+  })
+);
+
+router.get(
+  '/failed/export',
+  asyncHandler(async (req, res) => {
+    const paging = { page: 1, limit: 50000, offset: 0 };
+    const data = await listFailed(req.user, filtersFrom(req), paging);
+    await writeAudit({
+      userId: req.user.id,
+      action: 'report.failed_export',
+      entityType: 'report',
+      meta: { count: data.rows.length, format: req.query.format || 'csv' },
+      ip: req.ip,
+    });
+    await exportRows({
+      res,
+      filename: `failed-messages-${Date.now()}`,
+      format: req.query.format,
+      columns: [
+        { header: 'Phone', key: 'phone' },
+        { header: 'Campaign', key: 'campaign_name' },
+        { header: 'Template', key: 'template_name' },
+        { header: 'Error code', key: 'error_code' },
+        { header: 'Error', key: 'error_message' },
+        { header: 'Failed At', key: 'failed_at' },
+      ],
+      rows: data.rows,
+    });
+  })
+);
+
+router.get(
+  '/usage',
+  asyncHandler(async (req, res) => {
+    const data = await getUsage(req.user, filtersFrom(req));
+    res.json({ success: true, data });
+  })
+);
+
+router.get(
+  '/usage/export',
+  asyncHandler(async (req, res) => {
+    const data = await getUsage(req.user, filtersFrom(req));
+    await writeAudit({
+      userId: req.user.id,
+      action: 'report.usage_export',
+      entityType: 'report',
+      meta: { format: req.query.format || 'csv' },
+      ip: req.ip,
+    });
+    await exportRows({
+      res,
+      filename: `usage-report-${Date.now()}`,
+      format: req.query.format,
+      columns: [
+        { header: 'Date', key: 'date' },
+        { header: 'Messages', key: 'messages' },
+        { header: 'Sent', key: 'sent' },
+        { header: 'Delivered', key: 'delivered' },
+        { header: 'Failed', key: 'failed' },
+        { header: 'Cost', key: 'cost' },
+      ],
+      rows: data.daily,
+    });
+  })
+);
+
+router.post(
+  '/failed/retry',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.body?.id || req.body?.messageId);
+    const data = await retryFailedMessages(req.user, { ids: [id] }, req.ip);
+    res.json({ success: true, data });
+  })
+);
+
+router.post(
+  '/failed/retry-selected',
+  asyncHandler(async (req, res) => {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    const data = await retryFailedMessages(req.user, { ids }, req.ip);
+    res.json({ success: true, data });
+  })
+);
+
+router.post(
+  '/failed/retry-all',
+  asyncHandler(async (req, res) => {
+    const data = await retryFailedMessages(
+      req.user,
+      { all: true, filters: { ...filtersFrom(req), ...req.body?.filters } },
+      req.ip
     );
-    res.json({ success: true, data: rows });
+    res.json({ success: true, data });
   })
 );
 

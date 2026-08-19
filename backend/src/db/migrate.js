@@ -883,7 +883,27 @@ async function migrate() {
           OR email LIKE 'test-diag-%@example.com'
           OR email = 'admin@example.com'`
     );
+  } catch (err) {
+    console.warn('probe account cleanup skipped:', err.message);
+  }
 
+  const reportIndexes = [
+    `ALTER TABLE campaigns ADD INDEX idx_campaigns_created_by (created_by)`,
+    `ALTER TABLE campaigns ADD INDEX idx_campaigns_created_at (created_at)`,
+    `ALTER TABLE campaigns ADD INDEX idx_campaigns_whatsapp (whatsapp_account_id)`,
+    `ALTER TABLE campaign_messages ADD INDEX idx_cm_status_created (status, created_at)`,
+    `ALTER TABLE campaign_messages ADD INDEX idx_cm_failed_at (failed_at)`,
+    `ALTER TABLE campaign_messages ADD INDEX idx_cm_campaign_created (campaign_id, created_at)`,
+  ];
+  for (const sql of reportIndexes) {
+    try {
+      await root.query(sql);
+    } catch (err) {
+      if (err.code !== 'ER_DUP_KEYNAME') console.warn('report index skipped:', err.message);
+    }
+  }
+
+  try {
     const [firstUsers] = await root.query(
       `SELECT id, email, role, is_active FROM users ORDER BY id ASC LIMIT 1`
     );
