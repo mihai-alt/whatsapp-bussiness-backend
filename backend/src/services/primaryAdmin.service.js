@@ -106,19 +106,18 @@ export async function assertOnlyPrimaryAdminMayChangeAdminAuthority(
 }
 
 /**
- * Remaining admins cannot set another admin's password.
- * They may still change their own password. Members stay editable by any admin.
+ * Remaining admins cannot manage another admin at all (name, password, role, status).
+ * They may still edit themselves and members. Only the first admin may edit other admins.
  */
-export async function assertOnlyPrimaryAdminMaySetOtherAdminPassword(actorId, target, password) {
-  if (!password) return;
+export async function assertOnlyPrimaryAdminMayManageOtherAdmin(actorId, target) {
   if (String(target?.role) !== 'admin') return;
   if (Number(actorId) === Number(target.id)) return;
   if (await isPrimaryAdmin(actorId)) return;
 
   throw new AppError(
-    "Only the first administrator can set another administrator's password.",
+    'Only the first administrator can manage another administrator.',
     403,
-    'ADMIN_PASSWORD_LOCKED'
+    'ADMIN_MANAGE_LOCKED'
   );
 }
 
