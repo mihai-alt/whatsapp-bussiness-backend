@@ -10,28 +10,29 @@ router.use(authenticate);
 router.get(
   '/',
   asyncHandler(async (req, res) => {
-    const accounts = await query(
-      `SELECT id, phone_number, phone_number_id, waba_id, business_name, quality_rating,
-              messaging_limit, status, profile_picture_url
-       FROM whatsapp_accounts WHERE status = 'connected' ORDER BY id DESC`
-    );
-    const wallet = await getWallet();
-
-    const today = await query(
-      `SELECT
-         SUM(status IN ('sent','delivered','read')) AS sent,
-         SUM(status = 'delivered') AS delivered,
-         SUM(status = 'read') AS \`read\`,
-         SUM(status = 'failed') AS failed,
-         SUM(status IN ('pending','queued')) AS pending
-       FROM campaign_messages
-       WHERE DATE(created_at) = CURDATE()`
-    );
-
-    const recentCampaigns = await query(
-      `SELECT id, name, status, total_count, sent_count, delivered_count, read_count, failed_count, pending_count, created_at
-       FROM campaigns ORDER BY id DESC LIMIT 8`
-    );
+    const [accounts, wallet, today, recentCampaigns] = await Promise.all([
+      query(
+        `SELECT id, phone_number, phone_number_id, waba_id, business_name, quality_rating,
+                messaging_limit, status, profile_picture_url
+         FROM whatsapp_accounts WHERE status = 'connected' ORDER BY id DESC`
+      ),
+      getWallet(),
+      query(
+        `SELECT
+           SUM(status IN ('sent','delivered','read')) AS sent,
+           SUM(status = 'delivered') AS delivered,
+           SUM(status = 'read') AS \`read\`,
+           SUM(status = 'failed') AS failed,
+           SUM(status IN ('pending','queued')) AS pending
+         FROM campaign_messages
+         WHERE created_at >= UTC_DATE()
+           AND created_at < UTC_DATE() + INTERVAL 1 DAY`
+      ),
+      query(
+        `SELECT id, name, status, total_count, sent_count, delivered_count, read_count, failed_count, pending_count, created_at
+         FROM campaigns ORDER BY id DESC LIMIT 8`
+      ),
+    ]);
 
     res.json({
       success: true,
